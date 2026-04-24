@@ -27,6 +27,7 @@ export interface Transfer {
     downloadUrl?: string
     speed?: number            // bytes/sec
     startedAt?: number        // timestamp for ETA calculation
+    lastUpdate?: number       // timestamp of last UI update for throttling
     batchId?: string          // group multi-file transfers
     totalFiles?: number       // total files in batch
     completedFiles?: number   // completed files in batch

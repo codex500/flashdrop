@@ -19,8 +19,8 @@ const RTC_CONFIG: RTCConfiguration = {
     ],
 }
 
-// Chunk size: 64KB — safe default for all browsers
-const CHUNK_SIZE = 64 * 1024
+// Chunk size: 512KB — Optimized for maximum throughput on local networks
+const CHUNK_SIZE = 512 * 1024
 
 // ─── Device name detection ────────────────────────────────────────────────────
 function getDeviceName(): string {
@@ -160,6 +160,7 @@ export function useFlashDrop() {
             pc.ondatachannel = (e) => {
                 const dc = e.channel
                 dc.binaryType = 'arraybuffer'
+                let lastUiUpdate = 0
 
                 dc.onopen = () => {
                     setTransfers(prev => prev.map(t =>
@@ -193,13 +194,19 @@ export function useFlashDrop() {
                         // Binary chunk
                         receivedChunks.push(ev.data)
                         receivedBytes += ev.data.byteLength
-                        const progress = Math.min(99, Math.round((receivedBytes / fileSize) * 100))
-                        const elapsed = (Date.now() - startedAt) / 1000
-                        const speed = elapsed > 0 ? receivedBytes / elapsed : 0
 
-                        setTransfers(prev => prev.map(t =>
-                            t.id === transferId ? { ...t, progress, speed } : t
-                        ))
+                        const now = Date.now()
+                        // Throttle UI updates to twice a second to completely unblock the main thread for max speed
+                        if (now - lastUiUpdate > 500 || receivedBytes === fileSize) {
+                            lastUiUpdate = now
+                            const progress = Math.min(99, Math.round((receivedBytes / fileSize) * 100))
+                            const elapsed = (now - startedAt) / 1000
+                            const speed = elapsed > 0 ? receivedBytes / elapsed : 0
+
+                            setTransfers(prev => prev.map(tr =>
+                                tr.id === transferId ? { ...tr, progress, speed, lastUpdate: now } : tr
+                            ))
+                        }
                     }
                 }
 
@@ -306,48 +313,62 @@ export function useFlashDrop() {
         return () => { socket.disconnect() }
     }, [])
 
-    // ─── Stream file over DataChannel ─────────────────────────────────────────
-    function streamFile(dc: RTCDataChannel, file: File, transferId: string) {
+    // ─── Stream file over DataChannel (Maximum Speed) ─────────────────────────
+    async function streamFile(dc: RTCDataChannel, file: File, transferId: string) {
         const startedAt = Date.now()
         let offset = 0
+        let lastUiUpdate = 0
+        const MAX_BUFFER = 64 * 1024 * 1024; // 64MB buffer threshold
+        dc.bufferedAmountLowThreshold = 32 * 1024 * 1024; // Start refilling when buffer drops to 32MB
 
-        const sendNextChunk = () => {
-            // Respect DataChannel buffer — don't overflow it
-            if (dc.bufferedAmount > CHUNK_SIZE * 8) {
-                setTimeout(sendNextChunk, 50)
-                return
+        try {
+            while (offset < file.size) {
+                if (dc.bufferedAmount > MAX_BUFFER) {
+                    // Pause streaming until the browser's internal WebRTC buffer drains
+                    await new Promise<void>(resolve => {
+                        const onLow = () => {
+                            dc.removeEventListener('bufferedamountlow', onLow)
+                            resolve()
+                        }
+                        dc.addEventListener('bufferedamountlow', onLow)
+                    })
+                }
+
+                if (dc.readyState !== 'open') break;
+
+                const slice = file.slice(offset, offset + CHUNK_SIZE)
+                const arrayBuffer = await slice.arrayBuffer()
+                
+                if (dc.readyState !== 'open') break;
+
+                dc.send(arrayBuffer)
+                offset += arrayBuffer.byteLength
+
+                const now = Date.now()
+                // Throttle UI updates to twice a second to completely unblock the main thread for max speed
+                if (now - lastUiUpdate > 500 || offset >= file.size) {
+                    lastUiUpdate = now
+                    const progress = Math.min(99, Math.round((offset / file.size) * 100))
+                    const elapsed = (now - startedAt) / 1000
+                    const speed = elapsed > 0 ? offset / elapsed : 0
+
+                    setTransfers(prev => prev.map(t =>
+                        t.id === transferId ? { ...t, progress, speed } : t
+                    ))
+                }
             }
 
-            if (offset >= file.size) {
+            if (dc.readyState === 'open') {
                 dc.send('__done__')
                 setTransfers(prev => prev.map(t =>
                     t.id === transferId ? { ...t, status: 'completed', progress: 100 } : t
                 ))
                 toast.success('Transfer complete!')
-                return
             }
-
-            const slice = file.slice(offset, offset + CHUNK_SIZE)
-            const reader = new FileReader()
-            reader.onload = (e) => {
-                if (!e.target?.result) return
-                dc.send(e.target.result as ArrayBuffer)
-                offset += CHUNK_SIZE
-
-                const progress = Math.min(99, Math.round((offset / file.size) * 100))
-                const elapsed = (Date.now() - startedAt) / 1000
-                const speed = elapsed > 0 ? offset / elapsed : 0
-
-                setTransfers(prev => prev.map(t =>
-                    t.id === transferId ? { ...t, progress, speed } : t
-                ))
-
-                sendNextChunk()
-            }
-            reader.readAsArrayBuffer(slice)
+        } catch (err) {
+            console.error('Streaming error:', err)
+            toast.error('Transfer interrupted.')
         }
-
-        sendNextChunk()
     }
 
     // ─── Utility: listen for one event then stop ──────────────────────────────
