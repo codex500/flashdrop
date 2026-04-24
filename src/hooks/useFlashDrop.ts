@@ -19,8 +19,8 @@ const RTC_CONFIG: RTCConfiguration = {
     ],
 }
 
-// Chunk size: 256KB — absolute maximum safe cross-browser limit for RTCDataChannel
-const CHUNK_SIZE = 256 * 1024
+// Chunk size: 64KB — absolute maximum safe cross-browser limit for RTCDataChannel
+const CHUNK_SIZE = 64 * 1024
 
 // ─── Device name detection ────────────────────────────────────────────────────
 function getDeviceName(): string {
@@ -318,8 +318,8 @@ export function useFlashDrop() {
         const startedAt = Date.now()
         let offset = 0
         let lastUiUpdate = 0
-        const MAX_BUFFER = 64 * 1024 * 1024; // 64MB buffer threshold
-        dc.bufferedAmountLowThreshold = 32 * 1024 * 1024; // Start refilling when buffer drops to 32MB
+        const MAX_BUFFER = 2 * 1024 * 1024; // 2MB buffer threshold to prevent memory crashes on Safari/Firefox/Mobile
+        dc.bufferedAmountLowThreshold = 1 * 1024 * 1024; // Start refilling when buffer drops to 1MB
 
         try {
             while (offset < file.size) {
