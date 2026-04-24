@@ -4,7 +4,14 @@ import axios from 'axios'
 import toast from 'react-hot-toast'
 import { Device, FileEntry, Transfer, TransferStatus, MAX_FILE_SIZE, formatSize } from '../types'
 
-export const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3001'
+const getBackendUrl = () => {
+    const envUrl = (import.meta as any).env.VITE_BACKEND_URL;
+    if (envUrl) {
+        return envUrl.replace(/\/$/, ''); // Remove trailing slash
+    }
+    return 'http://localhost:3001';
+};
+export const BACKEND_URL = getBackendUrl();
 
 function getDeviceName(): string {
     const ua = navigator.userAgent
