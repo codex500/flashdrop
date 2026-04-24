@@ -226,15 +226,20 @@ export function useFlashDrop() {
                         const view = new DataView(data);
                         const idx = view.getUint32(0, true);
                         
+                        // IMMEDIATELY Send ACK to unblock sender
+                        if (dc.readyState === 'open') {
+                            dc.send(`ack:${idx}`);
+                        }
+                        
                         if (receivedChunksTracker[idx] === 0) {
                             receivedChunksTracker[idx] = 1;
                             const chunkData = data.slice(4);
                             receivedBytes += chunkData.byteLength;
 
                             if (isUsingOPFS && writable) {
-                                try {
-                                    await writable.write({ type: 'write', position: idx * CHUNK_SIZE, data: new Uint8Array(data, 4) });
-                                } catch(err) { console.error("OPFS write error", err); }
+                                // Do not await to avoid blocking the receiver loop!
+                                writable.write({ type: 'write', position: idx * CHUNK_SIZE, data: new Uint8Array(data, 4) })
+                                    .catch((err: any) => console.error("OPFS write error", err));
                             } else {
                                 fallbackBuffer[idx] = chunkData;
                             }
@@ -251,11 +256,6 @@ export function useFlashDrop() {
                                     tr.id === transferId ? { ...tr, progress, speed, lastUpdate: now } : tr
                                 ))
                             }
-                        }
-
-                        // Send ACK
-                        if (dc.readyState === 'open') {
-                            dc.send(`ack:${idx}`);
                         }
                     }
                 }
@@ -370,7 +370,7 @@ export function useFlashDrop() {
         let lastUiUpdate = 0
         
         const CHUNK_SIZE = 64000; // Safe WebRTC SCTP packet size limit
-        const MAX_CONCURRENCY = 40; // Max parallel chunks in-flight
+        const MAX_CONCURRENCY = 256; // Massive parallel queue (up to ~16MB in-flight) to saturate bandwidth
         const RETRY_TIMEOUT_MS = 1000;
         const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
         
