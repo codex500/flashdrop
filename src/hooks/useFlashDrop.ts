@@ -48,7 +48,7 @@ function guessDeviceType(name: string): Device['type'] {
 // ─── Types for in-flight P2P connections ─────────────────────────────────────
 interface PeerState {
     pc: RTCPeerConnection
-    dc?: RTCDataChannel
+    dcs?: RTCDataChannel[]
     transferId: string
     targetDeviceId: string
 }
@@ -173,11 +173,13 @@ export function useFlashDrop() {
                 console.warn('OPFS not available, using memory fallback. Large files may crash.', err);
             }
 
-            // ── DataChannel opened by sender ─────────────────────────────────
+            // ── DataChannels opened by sender (Multi-Channel) ────────────────
+            let lastUiUpdate = 0;
+            let doneReceived = false;
+
             pc.ondatachannel = (e) => {
                 const dc = e.channel
                 dc.binaryType = 'arraybuffer'
-                let lastUiUpdate = 0
 
                 dc.onopen = () => {
                     setTransfers(prev => prev.map(t =>
@@ -188,7 +190,8 @@ export function useFlashDrop() {
                 dc.onmessage = async (ev) => {
                     if (typeof ev.data === 'string') {
                         // Control message — "done" signals end of transfer
-                        if (ev.data === '__done__') {
+                        if (ev.data === '__done__' && !doneReceived) {
+                            doneReceived = true;
                             try {
                                 let downloadUrl = '';
                                 if (isUsingOPFS && writable) {
@@ -262,12 +265,11 @@ export function useFlashDrop() {
 
                 dc.onerror = (err) => {
                     console.error('[DataChannel] Error:', err)
-                    setTransfers(prev => prev.map(t =>
-                        t.id === transferId ? { ...t, status: 'error', error: 'Connection error' } : t
-                    ))
-                    toast.error(`Transfer failed: ${fileName}`)
-                    pc.close()
-                    peersRef.current.delete(transferId)
+                    if (!doneReceived) {
+                        setTransfers(prev => prev.map(t =>
+                            t.id === transferId ? { ...t, status: 'error', error: 'Connection error' } : t
+                        ))
+                    }
                 }
             }
 
@@ -290,13 +292,32 @@ export function useFlashDrop() {
 
             const pc = peer.pc
 
-            // Create data channel for this transfer
-            const dc = pc.createDataChannel(`file-${transferId}`, {
-                ordered: false, // Unordered for maximum speed
-                maxRetransmits: 0 // Unreliable, we handle our own retries
-            })
-            dc.binaryType = 'arraybuffer'
-            peer.dc = dc
+            // Create multi-channel pool for maximum throughput
+            const NUM_CHANNELS = 6;
+            const dcs: RTCDataChannel[] = [];
+            let streamingStarted = false;
+
+            for (let i = 0; i < NUM_CHANNELS; i++) {
+                const dc = pc.createDataChannel(`file-${transferId}-${i}`, {
+                    ordered: false, 
+                    maxRetransmits: 0 
+                });
+                dc.binaryType = 'arraybuffer';
+                dcs.push(dc);
+                
+                dc.onopen = () => {
+                    if (!streamingStarted) {
+                        streamingStarted = true;
+                        const fileEntry = peer as any;
+                        if (fileEntry.file) streamFile(dcs, fileEntry.file, transferId);
+                    }
+                };
+                
+                dc.onerror = (err) => {
+                    console.error('[DataChannel] Sender error:', err);
+                };
+            }
+            peer.dcs = dcs;
 
             pc.onicecandidate = (e) => {
                 if (e.candidate) {
@@ -318,21 +339,6 @@ export function useFlashDrop() {
                 await pc.setRemoteDescription(new RTCSessionDescription(data.answer))
                 answerCleanup()
             })
-
-            // ── Start streaming when DataChannel opens ───────────────────────
-            dc.onopen = () => {
-                const fileEntry = peer as any
-                if (!fileEntry.file) return
-                streamFile(dc, fileEntry.file, transferId)
-            }
-
-            dc.onerror = (err) => {
-                console.error('[DataChannel] Sender error:', err)
-                setTransfers(prev => prev.map(t =>
-                    t.id === transferId ? { ...t, status: 'error', error: 'Connection error' } : t
-                ))
-                toast.error('Transfer failed.')
-            }
         })
 
         // ── Receiver declined ────────────────────────────────────────────────
@@ -364,118 +370,140 @@ export function useFlashDrop() {
         return () => { socket.disconnect() }
     }, [])
 
-    // ─── Stream file over DataChannel (Parallel Engine) ───────────────────────
-    async function streamFile(dc: RTCDataChannel, file: File, transferId: string) {
+    // ─── Stream file over Multi-Channel Adaptive Engine ───────────────────────
+    async function streamFile(dcs: RTCDataChannel[], file: File, transferId: string) {
         const startedAt = Date.now()
         let lastUiUpdate = 0
         
-        const CHUNK_SIZE = 64000; // Safe WebRTC SCTP packet size limit
-        const MAX_CONCURRENCY = 128; // Safe parallel queue (up to ~8MB in-flight) to prevent send queue full error
-        const RETRY_TIMEOUT_MS = 1000;
+        const CHUNK_SIZE = 64000;
         const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+        
+        // Adaptive Concurrency Controller
+        let concurrency = 64; 
+        const MIN_CONCURRENCY = 32;
+        const MAX_CONCURRENCY = 512; // Spread across 6 channels, easily avoiding 16MB per-channel queue limits
         
         let nextChunkIndex = 0;
         const ackedChunks = new Set<number>();
         const inFlight = new Map<number, number>(); // index -> timestamp
         
-        let isPaused = false;
         let isDone = false;
         
-        // Flow control thresholds (safe limits to prevent OperationError)
-        dc.bufferedAmountLowThreshold = 1 * 1024 * 1024; // 1MB
-        const MAX_BUFFER = 4 * 1024 * 1024; // 4MB to prevent send buffer overflow
+        // Round-robin channel selector
+        let dcIdx = 0;
+        const getNextDc = () => {
+            let startIdx = dcIdx;
+            do {
+                const dc = dcs[dcIdx];
+                dcIdx = (dcIdx + 1) % dcs.length;
+                if (dc.readyState === 'open' && dc.bufferedAmount < 2 * 1024 * 1024) return dc;
+            } while (dcIdx !== startIdx);
+            return null; // All open channels are heavily buffered
+        }
 
-        dc.addEventListener('message', (ev) => {
-            if (typeof ev.data === 'string') {
-                if (ev.data.startsWith('ack:')) {
-                    const idx = parseInt(ev.data.split(':')[1]);
-                    ackedChunks.add(idx);
-                    inFlight.delete(idx);
-                    
-                    // Update progress when a chunk is acked
-                    const now = Date.now();
-                    if (now - lastUiUpdate > 500 || ackedChunks.size === totalChunks) {
-                        lastUiUpdate = now;
-                        const progress = Math.min(99, Math.round((ackedChunks.size / totalChunks) * 100));
-                        const elapsed = (now - startedAt) / 1000;
-                        const sentBytes = ackedChunks.size * CHUNK_SIZE;
-                        const speed = elapsed > 0 ? sentBytes / elapsed : 0;
-                        setTransfers(prev => prev.map(t =>
-                            t.id === transferId ? { ...t, progress, speed } : t
-                        ));
+        dcs.forEach(dc => {
+            dc.bufferedAmountLowThreshold = 512 * 1024;
+            dc.addEventListener('bufferedamountlow', () => sendNext());
+            
+            dc.addEventListener('message', (ev) => {
+                if (typeof ev.data === 'string') {
+                    if (ev.data.startsWith('ack:')) {
+                        const idx = parseInt(ev.data.split(':')[1]);
+                        ackedChunks.add(idx);
+                        inFlight.delete(idx);
+                        
+                        // Adaptive throughput: Additive Increase
+                        if (concurrency < MAX_CONCURRENCY) {
+                            concurrency = Math.min(MAX_CONCURRENCY, concurrency + 0.5); 
+                        }
+                        
+                        const now = Date.now();
+                        if (now - lastUiUpdate > 500 || ackedChunks.size === totalChunks) {
+                            lastUiUpdate = now;
+                            const progress = Math.min(99, Math.round((ackedChunks.size / totalChunks) * 100));
+                            const elapsed = (now - startedAt) / 1000;
+                            const sentBytes = ackedChunks.size * CHUNK_SIZE;
+                            const speed = elapsed > 0 ? sentBytes / elapsed : 0;
+                            setTransfers(prev => prev.map(t =>
+                                t.id === transferId ? { ...t, progress, speed } : t
+                            ));
+                        }
+                        
+                        sendNext();
                     }
-                    
-                    sendNext();
-                } else if (ev.data === '__pause__') {
-                    isPaused = true;
-                } else if (ev.data === '__resume__') {
-                    isPaused = false;
-                    sendNext();
                 }
-            }
+            });
         });
         
         const sendChunk = async (idx: number) => {
-            if (isDone || dc.readyState !== 'open') return;
+            if (isDone) return false;
+            const dc = getNextDc();
+            if (!dc) return false;
+            
             const offset = idx * CHUNK_SIZE;
             const slice = file.slice(offset, offset + CHUNK_SIZE);
             const buffer = await slice.arrayBuffer();
             
-            if (isDone || dc.readyState !== 'open') return; // Check again after async operation
+            if (isDone || dc.readyState !== 'open') return false;
             
             const payload = new Uint8Array(4 + buffer.byteLength);
             const view = new DataView(payload.buffer);
-            view.setUint32(0, idx, true); // little-endian
+            view.setUint32(0, idx, true);
             payload.set(new Uint8Array(buffer), 4);
             
             try {
                 dc.send(payload);
                 inFlight.set(idx, Date.now());
+                return true;
             } catch(e) {
-                console.error("DC send error", e);
+                // Multiplicative Decrease on failure (congestion)
+                concurrency = Math.max(MIN_CONCURRENCY, Math.floor(concurrency * 0.5));
+                inFlight.delete(idx); // Let retry loop pick it up
+                return false;
             }
         };
 
         const sendNext = async () => {
-            if (isDone || isPaused || dc.readyState !== 'open') return;
-            if (dc.bufferedAmount > MAX_BUFFER) return;
-            
+            if (isDone) return;
             const now = Date.now();
             
             // 1. Retry timed-out chunks
             for (const [idx, lastSent] of inFlight.entries()) {
-                if (now - lastSent > RETRY_TIMEOUT_MS) {
-                    await sendChunk(idx);
-                    if (dc.bufferedAmount > MAX_BUFFER) return;
+                if (now - lastSent > 1500) {
+                    concurrency = Math.max(MIN_CONCURRENCY, Math.floor(concurrency * 0.8)); // Congestion Avoidance
+                    const sent = await sendChunk(idx);
+                    if (!sent) return; // All channels full
                 }
             }
             
-            // 2. Send new chunks
-            while (inFlight.size < MAX_CONCURRENCY && nextChunkIndex < totalChunks) {
-                const idx = nextChunkIndex++;
+            // 2. Zero-Idle Pipeline: Pump new chunks aggressively
+            while (inFlight.size < concurrency && nextChunkIndex < totalChunks) {
+                const idx = nextChunkIndex;
+                const dc = getNextDc();
+                if (!dc) break; // Network saturated
+                
+                nextChunkIndex++;
                 inFlight.set(idx, Date.now()); // Optimistic lock
                 sendChunk(idx).catch(console.error);
-                if (dc.bufferedAmount > MAX_BUFFER) break;
             }
             
-            // 3. Check completion
+            // 3. Completion
             if (ackedChunks.size === totalChunks && !isDone) {
                 isDone = true;
-                if (dc.readyState === 'open') {
-                    dc.send('__done__');
-                    setTransfers(prev => prev.map(t =>
-                        t.id === transferId ? { ...t, status: 'completed', progress: 100 } : t
-                    ));
-                    toast.success('Transfer complete!');
-                }
+                const activeDc = dcs.find(d => d.readyState === 'open');
+                if (activeDc) activeDc.send('__done__');
+                
+                setTransfers(prev => prev.map(t =>
+                    t.id === transferId ? { ...t, status: 'completed', progress: 100 } : t
+                ));
+                toast.success('Transfer complete!');
             }
         };
 
-        dc.addEventListener('bufferedamountlow', () => sendNext());
-        sendNext(); // Initial trigger
+        sendNext(); // Ignite engine
 
         const interval = setInterval(() => {
-            if (isDone || dc.readyState !== 'open') clearInterval(interval);
+            if (isDone) clearInterval(interval);
             else sendNext();
         }, 500);
     }
