@@ -1,10 +1,8 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect } from 'react'
 import { QRCodeSVG } from 'qrcode.react'
 import { Smartphone, RefreshCw, Copy, CheckCheck, Link2, QrCode } from 'lucide-react'
 import toast from 'react-hot-toast'
-import axios from 'axios'
 import clsx from 'clsx'
-import { BACKEND_URL } from '../hooks/useFlashDrop'
 
 interface QRSectionProps {
     sessionId: string
@@ -14,31 +12,19 @@ export default function QRSection({ sessionId }: QRSectionProps) {
     const [url, setUrl] = useState('')
     const [copied, setCopied] = useState(false)
     const [refreshing, setRefreshing] = useState(false)
-    const [error, setError] = useState(false)
-
-    const fetchQrData = useCallback(async () => {
-        if (!sessionId) return
-        try {
-            setRefreshing(true)
-            setError(false)
-            const res = await axios.get(`${BACKEND_URL}/qr?sessionId=${sessionId}&baseUrl=${encodeURIComponent(window.location.origin)}`)
-            setUrl(res.data.url)
-        } catch (err) {
-            console.error('Failed to fetch QR details:', err)
+    useEffect(() => {
+        if (sessionId) {
             setUrl(`${window.location.origin}/?session=${sessionId}`)
-            setError(true)
-        } finally {
-            setTimeout(() => setRefreshing(false), 500)
         }
     }, [sessionId])
 
-    useEffect(() => {
-        fetchQrData()
-    }, [fetchQrData])
-
     const handleRefresh = () => {
-        fetchQrData()
-        toast.success('QR code refreshed')
+        // Just visual feedback since URL doesn't actually change for same session
+        setRefreshing(true)
+        setTimeout(() => {
+            setRefreshing(false)
+            toast.success('QR code refreshed')
+        }, 500)
     }
 
     const handleCopy = async () => {
@@ -135,12 +121,6 @@ export default function QRSection({ sessionId }: QRSectionProps) {
                         }
                     </button>
                 </div>
-
-                {error && (
-                    <p className="text-xs text-amber-500 dark:text-amber-400 flex items-center gap-1">
-                        ⚠️ Using fallback URL — server QR endpoint unavailable
-                    </p>
-                )}
             </div>
         </section>
     )
