@@ -139,8 +139,6 @@ export function useFlashDrop() {
 
             // Set up RTCPeerConnection to receive
             const pc = new RTCPeerConnection(RTC_CONFIG)
-            const receivedChunks: ArrayBuffer[] = []
-            let receivedBytes = 0
             const startedAt = Date.now()
 
             peersRef.current.set(transferId, { pc, transferId, targetDeviceId: from })
@@ -156,6 +154,26 @@ export function useFlashDrop() {
                 }
             }
 
+            // ── OPFS Setup for Streaming to Disk ─────────────────────────────
+            let fileHandle: any = null;
+            let writable: any = null;
+            let isUsingOPFS = false;
+            
+            const CHUNK_SIZE = 256 * 1024;
+            const totalChunks = Math.ceil(fileSize / CHUNK_SIZE);
+            const receivedChunksTracker = new Uint8Array(totalChunks); // 0 = missing, 1 = received
+            const fallbackBuffer: ArrayBuffer[] = [];
+            let receivedBytes = 0;
+
+            try {
+                const root = await navigator.storage.getDirectory();
+                fileHandle = await root.getFileHandle(`${transferId}_${fileName}`, { create: true });
+                writable = await fileHandle.createWritable();
+                isUsingOPFS = true;
+            } catch (err) {
+                console.warn('OPFS not available, using memory fallback. Large files may crash.', err);
+            }
+
             // ── DataChannel opened by sender ─────────────────────────────────
             pc.ondatachannel = (e) => {
                 const dc = e.channel
@@ -168,44 +186,77 @@ export function useFlashDrop() {
                     ))
                 }
 
-                dc.onmessage = (ev) => {
+                dc.onmessage = async (ev) => {
                     if (typeof ev.data === 'string') {
                         // Control message — "done" signals end of transfer
                         if (ev.data === '__done__') {
-                            const blob = new Blob(receivedChunks, { type: mimeType })
-                            const url = URL.createObjectURL(blob)
-                            const a = document.createElement('a')
-                            a.href = url
-                            a.download = fileName
-                            document.body.appendChild(a)
-                            a.click()
-                            a.remove()
-                            setTimeout(() => URL.revokeObjectURL(url), 5000)
+                            try {
+                                let downloadUrl = '';
+                                if (isUsingOPFS && writable) {
+                                    await writable.close();
+                                    const file = await fileHandle.getFile();
+                                    downloadUrl = URL.createObjectURL(file);
+                                } else {
+                                    const blob = new Blob(fallbackBuffer, { type: mimeType });
+                                    downloadUrl = URL.createObjectURL(blob);
+                                }
 
-                            setTransfers(prev => prev.map(t =>
-                                t.id === transferId ? { ...t, status: 'completed', progress: 100 } : t
-                            ))
-                            toast.success(`Received ${fileName}`)
+                                const a = document.createElement('a')
+                                a.href = downloadUrl
+                                a.download = fileName
+                                document.body.appendChild(a)
+                                a.click()
+                                a.remove()
+                                setTimeout(() => URL.revokeObjectURL(downloadUrl), 5000)
 
-                            pc.close()
-                            peersRef.current.delete(transferId)
+                                setTransfers(prev => prev.map(t =>
+                                    t.id === transferId ? { ...t, status: 'completed', progress: 100 } : t
+                                ))
+                                toast.success(`Received ${fileName}`)
+                            } catch (err) {
+                                console.error('Finalize error', err);
+                                toast.error('Error saving file');
+                            } finally {
+                                pc.close()
+                                peersRef.current.delete(transferId)
+                            }
                         }
                     } else {
                         // Binary chunk
-                        receivedChunks.push(ev.data)
-                        receivedBytes += ev.data.byteLength
+                        const data = ev.data as ArrayBuffer;
+                        const view = new DataView(data);
+                        const idx = view.getUint32(0, true);
+                        
+                        if (receivedChunksTracker[idx] === 0) {
+                            receivedChunksTracker[idx] = 1;
+                            const chunkData = data.slice(4);
+                            receivedBytes += chunkData.byteLength;
 
-                        const now = Date.now()
-                        // Throttle UI updates to twice a second to completely unblock the main thread for max speed
-                        if (now - lastUiUpdate > 500 || receivedBytes === fileSize) {
-                            lastUiUpdate = now
-                            const progress = Math.min(99, Math.round((receivedBytes / fileSize) * 100))
-                            const elapsed = (now - startedAt) / 1000
-                            const speed = elapsed > 0 ? receivedBytes / elapsed : 0
+                            if (isUsingOPFS && writable) {
+                                try {
+                                    await writable.write({ type: 'write', position: idx * CHUNK_SIZE, data: new Uint8Array(data, 4) });
+                                } catch(err) { console.error("OPFS write error", err); }
+                            } else {
+                                fallbackBuffer[idx] = chunkData;
+                            }
 
-                            setTransfers(prev => prev.map(tr =>
-                                tr.id === transferId ? { ...tr, progress, speed, lastUpdate: now } : tr
-                            ))
+                            const now = Date.now()
+                            // Throttle UI updates
+                            if (now - lastUiUpdate > 500 || receivedBytes >= fileSize) {
+                                lastUiUpdate = now
+                                const progress = Math.min(99, Math.round((receivedBytes / fileSize) * 100))
+                                const elapsed = (now - startedAt) / 1000
+                                const speed = elapsed > 0 ? receivedBytes / elapsed : 0
+
+                                setTransfers(prev => prev.map(tr =>
+                                    tr.id === transferId ? { ...tr, progress, speed, lastUpdate: now } : tr
+                                ))
+                            }
+                        }
+
+                        // Send ACK
+                        if (dc.readyState === 'open') {
+                            dc.send(`ack:${idx}`);
                         }
                     }
                 }
@@ -242,7 +293,8 @@ export function useFlashDrop() {
 
             // Create data channel for this transfer
             const dc = pc.createDataChannel(`file-${transferId}`, {
-                ordered: true,
+                ordered: false, // Unordered for maximum speed
+                maxRetransmits: 0 // Unreliable, we handle our own retries
             })
             dc.binaryType = 'arraybuffer'
             peer.dc = dc
@@ -313,62 +365,118 @@ export function useFlashDrop() {
         return () => { socket.disconnect() }
     }, [])
 
-    // ─── Stream file over DataChannel (Maximum Speed) ─────────────────────────
+    // ─── Stream file over DataChannel (Parallel Engine) ───────────────────────
     async function streamFile(dc: RTCDataChannel, file: File, transferId: string) {
         const startedAt = Date.now()
-        let offset = 0
         let lastUiUpdate = 0
-        const MAX_BUFFER = 2 * 1024 * 1024; // 2MB buffer threshold to prevent memory crashes on Safari/Firefox/Mobile
-        dc.bufferedAmountLowThreshold = 1 * 1024 * 1024; // Start refilling when buffer drops to 1MB
+        
+        const CHUNK_SIZE = 256 * 1024; // 256KB for faster throughput
+        const MAX_CONCURRENCY = 40; // Max parallel chunks in-flight
+        const RETRY_TIMEOUT_MS = 1000;
+        const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+        
+        let nextChunkIndex = 0;
+        const ackedChunks = new Set<number>();
+        const inFlight = new Map<number, number>(); // index -> timestamp
+        
+        let isPaused = false;
+        let isDone = false;
+        
+        // Flow control thresholds (more aggressive for LAN)
+        dc.bufferedAmountLowThreshold = 2 * 1024 * 1024;
+        const MAX_BUFFER = 8 * 1024 * 1024; // 8MB
 
-        try {
-            while (offset < file.size) {
-                if (dc.bufferedAmount > MAX_BUFFER) {
-                    // Pause streaming until the browser's internal WebRTC buffer drains
-                    await new Promise<void>(resolve => {
-                        const onLow = () => {
-                            dc.removeEventListener('bufferedamountlow', onLow)
-                            resolve()
-                        }
-                        dc.addEventListener('bufferedamountlow', onLow)
-                    })
+        dc.addEventListener('message', (ev) => {
+            if (typeof ev.data === 'string') {
+                if (ev.data.startsWith('ack:')) {
+                    const idx = parseInt(ev.data.split(':')[1]);
+                    ackedChunks.add(idx);
+                    inFlight.delete(idx);
+                    
+                    // Update progress when a chunk is acked
+                    const now = Date.now();
+                    if (now - lastUiUpdate > 500 || ackedChunks.size === totalChunks) {
+                        lastUiUpdate = now;
+                        const progress = Math.min(99, Math.round((ackedChunks.size / totalChunks) * 100));
+                        const elapsed = (now - startedAt) / 1000;
+                        const sentBytes = ackedChunks.size * CHUNK_SIZE;
+                        const speed = elapsed > 0 ? sentBytes / elapsed : 0;
+                        setTransfers(prev => prev.map(t =>
+                            t.id === transferId ? { ...t, progress, speed } : t
+                        ));
+                    }
+                    
+                    sendNext();
+                } else if (ev.data === '__pause__') {
+                    isPaused = true;
+                } else if (ev.data === '__resume__') {
+                    isPaused = false;
+                    sendNext();
                 }
+            }
+        });
+        
+        const sendChunk = async (idx: number) => {
+            if (dc.readyState !== 'open') return;
+            const offset = idx * CHUNK_SIZE;
+            const slice = file.slice(offset, offset + CHUNK_SIZE);
+            const buffer = await slice.arrayBuffer();
+            
+            const payload = new Uint8Array(4 + buffer.byteLength);
+            const view = new DataView(payload.buffer);
+            view.setUint32(0, idx, true); // little-endian
+            payload.set(new Uint8Array(buffer), 4);
+            
+            try {
+                dc.send(payload);
+                inFlight.set(idx, Date.now());
+            } catch(e) {
+                console.error("DC send error", e);
+            }
+        };
 
-                if (dc.readyState !== 'open') break;
-
-                const slice = file.slice(offset, offset + CHUNK_SIZE)
-                const arrayBuffer = await slice.arrayBuffer()
-                
-                if (dc.readyState !== 'open') break;
-
-                dc.send(arrayBuffer)
-                offset += arrayBuffer.byteLength
-
-                const now = Date.now()
-                // Throttle UI updates to twice a second to completely unblock the main thread for max speed
-                if (now - lastUiUpdate > 500 || offset >= file.size) {
-                    lastUiUpdate = now
-                    const progress = Math.min(99, Math.round((offset / file.size) * 100))
-                    const elapsed = (now - startedAt) / 1000
-                    const speed = elapsed > 0 ? offset / elapsed : 0
-
+        const sendNext = async () => {
+            if (isDone || isPaused || dc.readyState !== 'open') return;
+            if (dc.bufferedAmount > MAX_BUFFER) return;
+            
+            const now = Date.now();
+            
+            // 1. Retry timed-out chunks
+            for (const [idx, lastSent] of inFlight.entries()) {
+                if (now - lastSent > RETRY_TIMEOUT_MS) {
+                    await sendChunk(idx);
+                    if (dc.bufferedAmount > MAX_BUFFER) return;
+                }
+            }
+            
+            // 2. Send new chunks
+            while (inFlight.size < MAX_CONCURRENCY && nextChunkIndex < totalChunks) {
+                const idx = nextChunkIndex++;
+                inFlight.set(idx, Date.now()); // Optimistic lock
+                sendChunk(idx).catch(console.error);
+                if (dc.bufferedAmount > MAX_BUFFER) break;
+            }
+            
+            // 3. Check completion
+            if (ackedChunks.size === totalChunks && !isDone) {
+                isDone = true;
+                if (dc.readyState === 'open') {
+                    dc.send('__done__');
                     setTransfers(prev => prev.map(t =>
-                        t.id === transferId ? { ...t, progress, speed } : t
-                    ))
+                        t.id === transferId ? { ...t, status: 'completed', progress: 100 } : t
+                    ));
+                    toast.success('Transfer complete!');
                 }
             }
+        };
 
-            if (dc.readyState === 'open') {
-                dc.send('__done__')
-                setTransfers(prev => prev.map(t =>
-                    t.id === transferId ? { ...t, status: 'completed', progress: 100 } : t
-                ))
-                toast.success('Transfer complete!')
-            }
-        } catch (err) {
-            console.error('Streaming error:', err)
-            toast.error('Transfer interrupted.')
-        }
+        dc.addEventListener('bufferedamountlow', () => sendNext());
+        sendNext(); // Initial trigger
+
+        const interval = setInterval(() => {
+            if (isDone || dc.readyState !== 'open') clearInterval(interval);
+            else sendNext();
+        }, 500);
     }
 
     // ─── Utility: listen for one event then stop ──────────────────────────────
