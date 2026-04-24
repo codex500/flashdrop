@@ -158,7 +158,7 @@ export function useFlashDrop() {
             let writable: any = null;
             let isUsingOPFS = false;
             
-            const CHUNK_SIZE = 256 * 1024;
+            const CHUNK_SIZE = 64000; // 64KB-ish safe limit for WebRTC
             const totalChunks = Math.ceil(fileSize / CHUNK_SIZE);
             const receivedChunksTracker = new Uint8Array(totalChunks); // 0 = missing, 1 = received
             const fallbackBuffer: ArrayBuffer[] = [];
@@ -369,7 +369,7 @@ export function useFlashDrop() {
         const startedAt = Date.now()
         let lastUiUpdate = 0
         
-        const CHUNK_SIZE = 256 * 1024; // 256KB for faster throughput
+        const CHUNK_SIZE = 64000; // Safe WebRTC SCTP packet size limit
         const MAX_CONCURRENCY = 40; // Max parallel chunks in-flight
         const RETRY_TIMEOUT_MS = 1000;
         const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
@@ -381,9 +381,9 @@ export function useFlashDrop() {
         let isPaused = false;
         let isDone = false;
         
-        // Flow control thresholds (more aggressive for LAN)
-        dc.bufferedAmountLowThreshold = 2 * 1024 * 1024;
-        const MAX_BUFFER = 8 * 1024 * 1024; // 8MB
+        // Flow control thresholds (safe limits to prevent OperationError)
+        dc.bufferedAmountLowThreshold = 1 * 1024 * 1024; // 1MB
+        const MAX_BUFFER = 4 * 1024 * 1024; // 4MB to prevent send buffer overflow
 
         dc.addEventListener('message', (ev) => {
             if (typeof ev.data === 'string') {
