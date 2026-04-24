@@ -1,46 +1,57 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { io, Socket } from 'socket.io-client'
-import axios from 'axios'
 import toast from 'react-hot-toast'
-import { Device, FileEntry, Transfer, TransferStatus, MAX_FILE_SIZE, formatSize } from '../types'
+import { Device, FileEntry, Transfer, MAX_FILE_SIZE, formatSize } from '../types'
 
+// ─── Backend URL (signaling server only) ──────────────────────────────────────
 const getBackendUrl = () => {
-    const envUrl = (import.meta as any).env.VITE_BACKEND_URL;
-    if (envUrl) {
-        return envUrl.replace(/\/$/, ''); // Remove trailing slash
-    }
-    return 'http://localhost:3001';
-};
-export const BACKEND_URL = getBackendUrl();
+    const envUrl = (import.meta as any).env.VITE_BACKEND_URL
+    return envUrl ? envUrl.replace(/\/$/, '') : 'http://localhost:3001'
+}
+export const BACKEND_URL = getBackendUrl()
 
+// ─── WebRTC config — public STUN servers for NAT traversal ───────────────────
+const RTC_CONFIG: RTCConfiguration = {
+    iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun.cloudflare.com:3478' },
+    ],
+}
+
+// Chunk size: 64KB — safe default for all browsers
+const CHUNK_SIZE = 64 * 1024
+
+// ─── Device name detection ────────────────────────────────────────────────────
 function getDeviceName(): string {
     const ua = navigator.userAgent
-    const isWin = ua.includes('Windows')
-    const isMac = ua.includes('Mac') && !ua.includes('iPhone')
-    const isIphone = ua.includes('iPhone')
-    const isAndroid = ua.includes('Android')
-    const isLinux = ua.includes('Linux') && !ua.includes('Android')
-    const isIPad = ua.includes('iPad') || (ua.includes('Mac') && 'ontouchend' in document)
-    const randomStr = Math.random().toString(36).substring(2, 6).toUpperCase()
-
-    if (isIPad) return `iPad (${randomStr})`
-    if (isIphone) return `iPhone (${randomStr})`
-    if (isMac) return `Mac (${randomStr})`
-    if (isWin) return `Windows PC (${randomStr})`
-    if (isAndroid) return `Android (${randomStr})`
-    if (isLinux) return `Linux (${randomStr})`
-    return `Device (${randomStr})`
+    const rand = Math.random().toString(36).substring(2, 6).toUpperCase()
+    if (ua.includes('iPad') || (ua.includes('Mac') && 'ontouchend' in document)) return `iPad (${rand})`
+    if (ua.includes('iPhone')) return `iPhone (${rand})`
+    if (ua.includes('Android')) return `Android (${rand})`
+    if (ua.includes('Mac') && !ua.includes('iPhone')) return `Mac (${rand})`
+    if (ua.includes('Windows')) return `Windows PC (${rand})`
+    if (ua.includes('Linux')) return `Linux (${rand})`
+    return `Device (${rand})`
 }
 
 function guessDeviceType(name: string): Device['type'] {
-    const lower = name.toLowerCase()
-    if (lower.includes('iphone')) return 'iphone'
-    if (lower.includes('ipad')) return 'tablet'
-    if (lower.includes('mac')) return 'mac'
-    if (lower.includes('windows')) return 'windows'
-    if (lower.includes('android')) return 'android'
-    if (lower.includes('linux')) return 'linux'
+    const l = name.toLowerCase()
+    if (l.includes('iphone')) return 'iphone'
+    if (l.includes('ipad')) return 'tablet'
+    if (l.includes('mac')) return 'mac'
+    if (l.includes('windows')) return 'windows'
+    if (l.includes('android')) return 'android'
+    if (l.includes('linux')) return 'linux'
     return 'unknown'
+}
+
+// ─── Types for in-flight P2P connections ─────────────────────────────────────
+interface PeerState {
+    pc: RTCPeerConnection
+    dc?: RTCDataChannel
+    transferId: string
+    targetDeviceId: string
 }
 
 export function useFlashDrop() {
@@ -52,39 +63,42 @@ export function useFlashDrop() {
     const sessionIdRef = useRef<string>('')
     const deviceIdRef = useRef<string>('')
 
-    // 1. Initial connection — all socket listeners registered ONCE
+    // Active RTCPeerConnections keyed by transferId
+    const peersRef = useRef<Map<string, PeerState>>(new Map())
+
+    // ─── Socket.io connection (signaling only) ────────────────────────────────
     useEffect(() => {
         const urlParams = new URLSearchParams(window.location.search)
         const initialSessionId = urlParams.get('session') || ''
 
-        const newSocket = io(BACKEND_URL, {
+        const socket = io(BACKEND_URL, {
             transports: ['websocket'],
             reconnection: true,
             reconnectionAttempts: 10,
             reconnectionDelay: 1000,
-            timeout: 30000,
+            timeout: 20000,
         })
-        socketRef.current = newSocket
+        socketRef.current = socket
 
-        newSocket.on('connect', () => {
-            newSocket.emit('connect-device', {
+        // ── Session management ───────────────────────────────────────────────
+        socket.on('connect', () => {
+            socket.emit('connect-device', {
                 sessionId: initialSessionId,
                 deviceName: getDeviceName(),
             })
         })
 
-        newSocket.on('device-joined', ({ device, sessionId: newSessionId }: any) => {
-            setSessionId(newSessionId)
-            sessionIdRef.current = newSessionId
+        socket.on('device-joined', ({ device, sessionId: sid }: any) => {
+            setSessionId(sid)
+            sessionIdRef.current = sid
             deviceIdRef.current = device.deviceId
-
-            const newUrl = new URL(window.location.href)
-            newUrl.searchParams.set('session', newSessionId)
-            window.history.replaceState({}, '', newUrl)
+            const url = new URL(window.location.href)
+            url.searchParams.set('session', sid)
+            window.history.replaceState({}, '', url)
         })
 
-        newSocket.on('device-list', (backendDevices: any[]) => {
-            setDevices(backendDevices
+        socket.on('device-list', (list: any[]) => {
+            setDevices(list
                 .filter(d => d.deviceId !== deviceIdRef.current)
                 .map(d => ({
                     id: d.deviceId,
@@ -96,180 +110,257 @@ export function useFlashDrop() {
             )
         })
 
-        newSocket.on('device-left', ({ deviceId: leftDeviceId, deviceName }: any) => {
+        socket.on('device-left', ({ deviceId: id, deviceName }: any) => {
             toast(`${deviceName} disconnected`, { icon: '👋' })
-            setDevices(prev => prev.filter(d => d.id !== leftDeviceId))
+            setDevices(prev => prev.filter(d => d.id !== id))
         })
 
-        // ─── Receive file (download handler) ─────────────────────────────────
-        newSocket.on('receive-file', async (payload: any) => {
-            const newTransferId = payload.fileId
-            const startedAt = Date.now()
+        // ── Incoming file request (RECEIVER side) ────────────────────────────
+        socket.on('file-request', async (payload: any) => {
+            const { from, fromName, transferId, fileName, fileSize, mimeType } = payload
 
+            // Add to transfers list as "pending"
             setTransfers(prev => [...prev, {
-                id: newTransferId,
-                fileName: payload.fileName,
-                fileSize: payload.fileSize,
+                id: transferId,
+                fileName,
+                fileSize,
                 progress: 0,
                 status: 'receiving',
                 direction: 'receive',
-                deviceName: payload.fromName,
-                deviceId: payload.from,
-                downloadUrl: payload.downloadUrl,
-                startedAt,
+                deviceName: fromName,
+                deviceId: from,
+                startedAt: Date.now(),
             }])
 
-            toast(`Receiving ${payload.fileName} from ${payload.fromName}...`, { icon: '📥' })
+            toast(`${fromName} wants to send ${fileName} (${formatSize(fileSize)})`, { icon: '📥', duration: 8000 })
 
-            // Notify sender we accepted
-            newSocket.emit('transfer-status', {
-                targetDeviceId: payload.from,
-                fileId: newTransferId,
-                status: 'accepted',
-                progress: 0
+            // Auto-accept (you can add a confirm dialog here if desired)
+            socket.emit('file-accepted', { targetDeviceId: from, transferId })
+
+            // Set up RTCPeerConnection to receive
+            const pc = new RTCPeerConnection(RTC_CONFIG)
+            const receivedChunks: ArrayBuffer[] = []
+            let receivedBytes = 0
+            const startedAt = Date.now()
+
+            peersRef.current.set(transferId, { pc, transferId, targetDeviceId: from })
+
+            // ── ICE candidates from receiver → sender via signaling ──────────
+            pc.onicecandidate = (e) => {
+                if (e.candidate) {
+                    socket.emit('webrtc-ice', {
+                        targetDeviceId: from,
+                        transferId,
+                        candidate: e.candidate,
+                    })
+                }
+            }
+
+            // ── DataChannel opened by sender ─────────────────────────────────
+            pc.ondatachannel = (e) => {
+                const dc = e.channel
+                dc.binaryType = 'arraybuffer'
+
+                dc.onopen = () => {
+                    setTransfers(prev => prev.map(t =>
+                        t.id === transferId ? { ...t, status: 'receiving' } : t
+                    ))
+                }
+
+                dc.onmessage = (ev) => {
+                    if (typeof ev.data === 'string') {
+                        // Control message — "done" signals end of transfer
+                        if (ev.data === '__done__') {
+                            const blob = new Blob(receivedChunks, { type: mimeType })
+                            const url = URL.createObjectURL(blob)
+                            const a = document.createElement('a')
+                            a.href = url
+                            a.download = fileName
+                            document.body.appendChild(a)
+                            a.click()
+                            a.remove()
+                            setTimeout(() => URL.revokeObjectURL(url), 5000)
+
+                            setTransfers(prev => prev.map(t =>
+                                t.id === transferId ? { ...t, status: 'completed', progress: 100 } : t
+                            ))
+                            toast.success(`Received ${fileName}`)
+
+                            pc.close()
+                            peersRef.current.delete(transferId)
+                        }
+                    } else {
+                        // Binary chunk
+                        receivedChunks.push(ev.data)
+                        receivedBytes += ev.data.byteLength
+                        const progress = Math.min(99, Math.round((receivedBytes / fileSize) * 100))
+                        const elapsed = (Date.now() - startedAt) / 1000
+                        const speed = elapsed > 0 ? receivedBytes / elapsed : 0
+
+                        setTransfers(prev => prev.map(t =>
+                            t.id === transferId ? { ...t, progress, speed } : t
+                        ))
+                    }
+                }
+
+                dc.onerror = (err) => {
+                    console.error('[DataChannel] Error:', err)
+                    setTransfers(prev => prev.map(t =>
+                        t.id === transferId ? { ...t, status: 'error', error: 'Connection error' } : t
+                    ))
+                    toast.error(`Transfer failed: ${fileName}`)
+                    pc.close()
+                    peersRef.current.delete(transferId)
+                }
+            }
+
+            // ── Wait for WebRTC offer from sender ────────────────────────────
+            const offerCleanup = onceSocketEvent(socket, 'webrtc-offer', async (data: any) => {
+                if (data.transferId !== transferId) return
+                await pc.setRemoteDescription(new RTCSessionDescription(data.offer))
+                const answer = await pc.createAnswer()
+                await pc.setLocalDescription(answer)
+                socket.emit('webrtc-answer', { targetDeviceId: from, transferId, answer })
+                offerCleanup()
+            })
+        })
+
+        // ── Receiver accepted our file (SENDER side) ─────────────────────────
+        socket.on('file-accepted', async (payload: any) => {
+            const { transferId, from } = payload
+            const peer = peersRef.current.get(transferId)
+            if (!peer) return
+
+            const pc = peer.pc
+
+            // Create data channel for this transfer
+            const dc = pc.createDataChannel(`file-${transferId}`, {
+                ordered: true,
+            })
+            dc.binaryType = 'arraybuffer'
+            peer.dc = dc
+
+            pc.onicecandidate = (e) => {
+                if (e.candidate) {
+                    socket.emit('webrtc-ice', {
+                        targetDeviceId: from,
+                        transferId,
+                        candidate: e.candidate,
+                    })
+                }
+            }
+
+            const offer = await pc.createOffer()
+            await pc.setLocalDescription(offer)
+            socket.emit('webrtc-offer', { targetDeviceId: from, transferId, offer })
+
+            // ── Wait for answer ──────────────────────────────────────────────
+            const answerCleanup = onceSocketEvent(socket, 'webrtc-answer', async (data: any) => {
+                if (data.transferId !== transferId) return
+                await pc.setRemoteDescription(new RTCSessionDescription(data.answer))
+                answerCleanup()
             })
 
-            // PRODUCTION SAFEGUARD: Prevent browser RAM crash for large files
-            if (payload.fileSize > 250 * 1024 * 1024) { // > 250MB
-                const url = `${BACKEND_URL}${payload.downloadUrl}?name=${encodeURIComponent(payload.fileName)}`
-                const a = document.createElement('a')
-                a.href = url
-                a.download = payload.fileName
-                document.body.appendChild(a)
-                a.click()
-                a.remove()
+            // ── Start streaming when DataChannel opens ───────────────────────
+            dc.onopen = () => {
+                const fileEntry = peer as any
+                if (!fileEntry.file) return
+                streamFile(dc, fileEntry.file, transferId)
+            }
 
+            dc.onerror = (err) => {
+                console.error('[DataChannel] Sender error:', err)
                 setTransfers(prev => prev.map(t =>
-                    t.id === newTransferId ? { ...t, status: 'completed', progress: 100 } : t
+                    t.id === transferId ? { ...t, status: 'error', error: 'Connection error' } : t
                 ))
-                toast.success(`Started native download for ${payload.fileName}`)
+                toast.error('Transfer failed.')
+            }
+        })
 
-                newSocket.emit('transfer-status', {
-                    targetDeviceId: payload.from,
-                    fileId: newTransferId,
-                    status: 'done',
-                    progress: 100
-                })
+        // ── Receiver declined ────────────────────────────────────────────────
+        socket.on('file-declined', (payload: any) => {
+            const { transferId } = payload
+            const peer = peersRef.current.get(transferId)
+            if (peer) { peer.pc.close(); peersRef.current.delete(transferId) }
+            setTransfers(prev => prev.map(t =>
+                t.id === transferId ? { ...t, status: 'error', error: 'Declined' } : t
+            ))
+            toast.error('File transfer was declined.')
+        })
+
+        // ── ICE candidates relay ─────────────────────────────────────────────
+        socket.on('webrtc-ice', async (payload: any) => {
+            const { transferId, candidate } = payload
+            const peer = peersRef.current.get(transferId)
+            if (peer?.pc && candidate) {
+                try { await peer.pc.addIceCandidate(new RTCIceCandidate(candidate)) } catch { /* ignore */ }
+            }
+        })
+
+        socket.on('error', ({ message }: any) => toast.error(message))
+        socket.on('reconnect', () => toast.success('Reconnected'))
+        socket.on('disconnect', (reason) => {
+            if (reason === 'io server disconnect') toast.error('Disconnected from server')
+        })
+
+        return () => { socket.disconnect() }
+    }, [])
+
+    // ─── Stream file over DataChannel ─────────────────────────────────────────
+    function streamFile(dc: RTCDataChannel, file: File, transferId: string) {
+        const startedAt = Date.now()
+        let offset = 0
+
+        const sendNextChunk = () => {
+            // Respect DataChannel buffer — don't overflow it
+            if (dc.bufferedAmount > CHUNK_SIZE * 8) {
+                setTimeout(sendNextChunk, 50)
                 return
             }
 
-            try {
-                const response = await axios({
-                    url: `${BACKEND_URL}${payload.downloadUrl}?name=${encodeURIComponent(payload.fileName)}`,
-                    method: 'GET',
-                    responseType: 'blob',
-                    timeout: 30 * 60 * 1000, // 30 min timeout for large files
-                    onDownloadProgress: (progressEvent) => {
-                        if (progressEvent.total) {
-                            const percent = Math.round((progressEvent.loaded * 100) / progressEvent.total)
-                            const elapsed = (Date.now() - startedAt) / 1000
-                            const speed = elapsed > 0 ? progressEvent.loaded / elapsed : 0
-
-                            setTransfers(prev => prev.map(t =>
-                                t.id === newTransferId
-                                    ? { ...t, progress: percent, speed }
-                                    : t
-                            ))
-
-                            newSocket.emit('transfer-status', {
-                                targetDeviceId: payload.from,
-                                fileId: newTransferId,
-                                status: percent === 100 ? 'done' : 'downloading',
-                                progress: percent
-                            })
-                        }
-                    }
-                })
-
-                // Download it visually in browser
-                const blob = new Blob([response.data])
-                const objectUrl = URL.createObjectURL(blob)
-                const a = document.createElement('a')
-                a.href = objectUrl
-                a.download = payload.fileName
-                document.body.appendChild(a)
-                a.click()
-                a.remove()
-                URL.revokeObjectURL(objectUrl)
-
+            if (offset >= file.size) {
+                dc.send('__done__')
                 setTransfers(prev => prev.map(t =>
-                    t.id === newTransferId
-                        ? { ...t, status: 'completed', progress: 100 }
-                        : t
+                    t.id === transferId ? { ...t, status: 'completed', progress: 100 } : t
                 ))
-                toast.success(`Received ${payload.fileName}`)
-
-            } catch (err) {
-                toast.error(`Failed to download ${payload.fileName}`)
-                setTransfers(prev => prev.map(t =>
-                    t.id === newTransferId
-                        ? { ...t, status: 'error', error: 'Download failed' }
-                        : t
-                ))
-                newSocket.emit('transfer-status', {
-                    targetDeviceId: payload.from,
-                    fileId: newTransferId,
-                    status: 'declined',
-                    progress: 0
-                })
-            }
-        })
-
-        // ─── Transfer status (sender sees receiver progress) ─────────────────
-        newSocket.on('transfer-status', (payload: any) => {
-            setTransfers(prev => prev.map(t => {
-                if (t.id === payload.fileId) {
-                    let newStatus: TransferStatus = t.status
-                    if (payload.status === 'accepted') newStatus = 'sending'
-                    else if (payload.status === 'declined') {
-                        newStatus = 'error'
-                        toast.error(`${t.deviceName} failed or declined the file.`)
-                    }
-                    else if (payload.status === 'downloading') newStatus = 'sending'
-                    else if (payload.status === 'done') newStatus = 'completed'
-
-                    // Map sender progress: upload was 0-50%, download is 50-100%
-                    const mappedProgress = payload.status === 'downloading' || payload.status === 'done'
-                        ? 50 + Math.round(payload.progress / 2)
-                        : payload.progress || t.progress
-
-                    return { ...t, progress: mappedProgress, status: newStatus }
-                }
-                return t
-            }))
-
-            if (payload.status === 'done') {
                 toast.success('Transfer complete!')
+                return
             }
-        })
 
-        newSocket.on('error', ({ message }: any) => {
-            toast.error(message)
-        })
+            const slice = file.slice(offset, offset + CHUNK_SIZE)
+            const reader = new FileReader()
+            reader.onload = (e) => {
+                if (!e.target?.result) return
+                dc.send(e.target.result as ArrayBuffer)
+                offset += CHUNK_SIZE
 
-        newSocket.on('reconnect', () => {
-            toast.success('Reconnected to server')
-        })
+                const progress = Math.min(99, Math.round((offset / file.size) * 100))
+                const elapsed = (Date.now() - startedAt) / 1000
+                const speed = elapsed > 0 ? offset / elapsed : 0
 
-        newSocket.on('disconnect', (reason) => {
-            if (reason === 'io server disconnect') {
-                toast.error('Disconnected from server')
+                setTransfers(prev => prev.map(t =>
+                    t.id === transferId ? { ...t, progress, speed } : t
+                ))
+
+                sendNextChunk()
             }
-        })
-
-        return () => {
-            newSocket.disconnect()
+            reader.readAsArrayBuffer(slice)
         }
-    }, [])
 
-    // ─── Send files (sequential with progress) ──────────────────────────────
+        sendNextChunk()
+    }
+
+    // ─── Utility: listen for one event then stop ──────────────────────────────
+    function onceSocketEvent(socket: Socket, event: string, handler: (data: any) => void) {
+        const wrapper = (data: any) => handler(data)
+        socket.on(event, wrapper)
+        return () => socket.off(event, wrapper)
+    }
+
+    // ─── Send files (creates one WebRTC connection per file) ──────────────────
     const sendFiles = useCallback(async (targetDevice: Device, files: FileEntry[]) => {
         if (!sessionIdRef.current || !socketRef.current) return
 
-        const batchId = `batch-${Date.now()}`
-        const totalFiles = files.length
-
-        // Validate file sizes before sending
         for (const entry of files) {
             if (entry.file.size > MAX_FILE_SIZE) {
                 toast.error(`${entry.file.name} exceeds 3GB limit (${formatSize(entry.file.size)})`)
@@ -279,11 +370,10 @@ export function useFlashDrop() {
 
         for (let i = 0; i < files.length; i++) {
             const entry = files[i]
-            const newTransferId = `tx-local-${entry.id}`
-            const startedAt = Date.now()
+            const transferId = `tx-${Date.now()}-${i}`
 
             setTransfers(prev => [...prev, {
-                id: newTransferId,
+                id: transferId,
                 fileName: entry.file.name,
                 fileSize: entry.file.size,
                 progress: 0,
@@ -291,79 +381,47 @@ export function useFlashDrop() {
                 direction: 'send',
                 deviceName: targetDevice.name,
                 deviceId: targetDevice.id,
-                startedAt,
-                batchId,
-                totalFiles,
+                startedAt: Date.now(),
+                totalFiles: files.length,
                 completedFiles: i,
             }])
 
-            toast(`Uploading ${entry.file.name} (${i + 1}/${totalFiles})...`, { icon: '⬆️' })
+            // Create peer connection for this transfer
+            const pc = new RTCPeerConnection(RTC_CONFIG)
 
-            const formData = new FormData()
-            formData.append('file', entry.file)
-            formData.append('sessionId', sessionIdRef.current)
-            formData.append('targetDeviceId', targetDevice.id)
+            // Store file reference on the peer state for later streaming
+            const peerState: PeerState & { file: File } = {
+                pc,
+                transferId,
+                targetDeviceId: targetDevice.id,
+                file: entry.file,
+            } as any
+            peersRef.current.set(transferId, peerState)
 
-            let retries = 0
-            const maxRetries = 1
+            // Signal the receiver about the incoming file
+            socketRef.current.emit('file-request', {
+                targetDeviceId: targetDevice.id,
+                transferId,
+                fileName: entry.file.name,
+                fileSize: entry.file.size,
+                mimeType: entry.file.type || 'application/octet-stream',
+            })
 
-            while (retries <= maxRetries) {
-                try {
-                    const response = await axios.post(`${BACKEND_URL}/upload`, formData, {
-                        headers: { 'Content-Type': 'multipart/form-data' },
-                        timeout: 30 * 60 * 1000, // 30 min timeout
-                        onUploadProgress: (progressEvent) => {
-                            if (progressEvent.total) {
-                                // Upload is 0-50% of total transfer
-                                const percent = Math.round((progressEvent.loaded * 50) / progressEvent.total)
-                                const elapsed = (Date.now() - startedAt) / 1000
-                                const speed = elapsed > 0 ? progressEvent.loaded / elapsed : 0
+            toast(`Offering ${entry.file.name} to ${targetDevice.name}...`, { icon: '📤' })
 
-                                setTransfers(prev => prev.map(t =>
-                                    t.id === newTransferId
-                                        ? { ...t, progress: percent, status: 'uploading', speed }
-                                        : t
-                                ))
-                            }
+            // Wait for transfer to complete before starting next file
+            await new Promise<void>((resolve) => {
+                const interval = setInterval(() => {
+                    setTransfers(prev => {
+                        const t = prev.find(t => t.id === transferId)
+                        if (t?.status === 'completed' || t?.status === 'error') {
+                            clearInterval(interval)
+                            resolve()
                         }
+                        return prev
                     })
-
-                    const { fileId, originalName, fileSize, mimeType } = response.data
-
-                    // Update local transfer ID to match server ID
-                    setTransfers(prev => prev.map(t =>
-                        t.id === newTransferId
-                            ? { ...t, id: fileId, status: 'sending', progress: 50, completedFiles: i + 1 }
-                            : t
-                    ))
-
-                    // Notify receiver via WebSocket
-                    socketRef.current!.emit('send-file', {
-                        targetDeviceId: targetDevice.id,
-                        fileId,
-                        fileName: originalName,
-                        fileSize,
-                        mimeType
-                    })
-
-                    break // Success, exit retry loop
-
-                } catch (err: any) {
-                    if (retries < maxRetries) {
-                        retries++
-                        toast(`Retrying ${entry.file.name}...`, { icon: '🔄' })
-                        await new Promise(r => setTimeout(r, 2000)) // Wait 2s before retry
-                    } else {
-                        const errorMsg = err?.response?.data?.error || err.message || 'Upload failed'
-                        toast.error(`Failed: ${entry.file.name} — ${errorMsg}`)
-                        setTransfers(prev => prev.map(t =>
-                            t.id === newTransferId
-                                ? { ...t, status: 'error', error: errorMsg }
-                                : t
-                        ))
-                    }
-                }
-            }
+                }, 500)
+            })
         }
     }, [])
 
