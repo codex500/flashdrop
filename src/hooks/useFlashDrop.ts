@@ -370,7 +370,7 @@ export function useFlashDrop() {
         let lastUiUpdate = 0
         
         const CHUNK_SIZE = 64000; // Safe WebRTC SCTP packet size limit
-        const MAX_CONCURRENCY = 256; // Massive parallel queue (up to ~16MB in-flight) to saturate bandwidth
+        const MAX_CONCURRENCY = 128; // Safe parallel queue (up to ~8MB in-flight) to prevent send queue full error
         const RETRY_TIMEOUT_MS = 1000;
         const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
         
