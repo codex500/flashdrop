@@ -19,8 +19,7 @@ const RTC_CONFIG: RTCConfiguration = {
     ],
 }
 
-// Chunk size: 64KB — absolute maximum safe cross-browser limit for RTCDataChannel
-const CHUNK_SIZE = 64 * 1024
+
 
 // ─── Device name detection ────────────────────────────────────────────────────
 function getDeviceName(): string {
