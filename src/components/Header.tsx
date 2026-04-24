@@ -1,4 +1,4 @@
-import { Zap, Moon, Sun, Wifi } from 'lucide-react'
+import { Zap, Moon, Sun } from 'lucide-react'
 
 interface HeaderProps {
     dark: boolean
