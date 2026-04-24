@@ -19,8 +19,8 @@ const RTC_CONFIG: RTCConfiguration = {
     ],
 }
 
-// Chunk size: 512KB — Optimized for maximum throughput on local networks
-const CHUNK_SIZE = 512 * 1024
+// Chunk size: 256KB — absolute maximum safe cross-browser limit for RTCDataChannel
+const CHUNK_SIZE = 256 * 1024
 
 // ─── Device name detection ────────────────────────────────────────────────────
 function getDeviceName(): string {
@@ -398,7 +398,7 @@ export function useFlashDrop() {
                 fileName: entry.file.name,
                 fileSize: entry.file.size,
                 progress: 0,
-                status: 'uploading',
+                status: 'sending',
                 direction: 'send',
                 deviceName: targetDevice.name,
                 deviceId: targetDevice.id,

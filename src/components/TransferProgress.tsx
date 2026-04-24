@@ -10,7 +10,7 @@ interface TransferProgressProps {
 
 function statusLabel(t: Transfer): string {
     switch (t.status) {
-        case 'uploading': return 'Uploading to server…'
+        case 'uploading': return 'Connecting to peer…'
         case 'sending': return `Sending to ${t.deviceName}…`
         case 'receiving': return `Receiving from ${t.deviceName}…`
         case 'completed': return 'Transfer complete!'
