@@ -416,10 +416,12 @@ export function useFlashDrop() {
         });
         
         const sendChunk = async (idx: number) => {
-            if (dc.readyState !== 'open') return;
+            if (isDone || dc.readyState !== 'open') return;
             const offset = idx * CHUNK_SIZE;
             const slice = file.slice(offset, offset + CHUNK_SIZE);
             const buffer = await slice.arrayBuffer();
+            
+            if (isDone || dc.readyState !== 'open') return; // Check again after async operation
             
             const payload = new Uint8Array(4 + buffer.byteLength);
             const view = new DataView(payload.buffer);
