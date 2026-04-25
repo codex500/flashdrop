@@ -513,40 +513,40 @@ export function useFlashDrop() {
             })
         })
 
-        // FIX: schedulePump() — serializes all pump() entry points behind a mutex.
+        // schedulePump() — serializes all pump() entry points behind a mutex.
         // Any number of callers (bufferedamountlow, heartbeat, ack handler, finally)
         // can call schedulePump() — only ONE pump() runs at a time.
         const schedulePump = () => {
             if (isPumping || isDone) return
             isPumping = true
-            // Use setTimeout(0) to yield to the event loop first, letting
-            // any in-progress sends update bufferedAmount before we re-enter pump.
-            setTimeout(() => {
-                pump()
+            setTimeout(async () => {
+                await pump()
                 isPumping = false
             }, 0)
         }
 
-        const pump = () => {
+        const pump = async () => {
             if (isDone) return
             const now = Date.now()
 
-            // 1. Retry timed-out chunks
+            // 1. Retry timed-out chunks (one at a time to avoid burst)
             for (const [msgId, flight] of inFlight.entries()) {
+                if (isDone) return
                 if (now - flight.timestamp > 3000) {
-                    const dc = getNextDc()
-                    if (dc && activeReaders < maxConcurrentReads) {
+                    if (activeReaders < maxConcurrentReads) {
                         activeReaders++
                         flight.timestamp = Date.now()
                         recentErrors++
-                        sendChunk(msgId, flight.offset, flight.size, dc)
-                            .finally(() => { activeReaders--; schedulePump() })
+                        await sendChunk(msgId, flight.offset, flight.size)
+                        activeReaders--
                     }
                 }
             }
 
-            // 2. Zero-Idle Pump — fill pipeline without blocking
-            while (currentOffset < file.size && activeReaders < maxConcurrentReads) {
+            // 2. Sequential Pump — send ONE chunk at a time.
+            // This ensures each dc.send() completes and bufferedAmount updates
+            // before the next send decision is made. No burst overflow.
+            while (currentOffset < file.size && activeReaders < maxConcurrentReads && !isDone) {
                 const dc = getNextDc()
                 if (!dc) break
 
@@ -557,14 +557,18 @@ export function useFlashDrop() {
 
                 inFlight.set(msgId, { offset, size, timestamp: Date.now() })
                 activeReaders++
-                sendChunk(msgId, offset, size, dc)
-                    .finally(() => { activeReaders--; schedulePump() })
+                await sendChunk(msgId, offset, size)
+                activeReaders--
+            }
+
+            // If there's still data to send, schedule another pump tick
+            if (currentOffset < file.size && !isDone) {
+                schedulePump()
             }
         }
 
-        const sendChunk = async (msgId: number, offset: number, size: number, dc: RTCDataChannel): Promise<void> => {
+        const sendChunk = async (msgId: number, offset: number, size: number): Promise<void> => {
             try {
-                // Guard: Uint32 offset max is ~4GB — assert for safety
                 if (offset > 0xFFFFFFFF) {
                     console.error('[FlashDrop] FATAL: offset exceeds Uint32 range — aborting chunk')
                     recentErrors++
@@ -574,15 +578,10 @@ export function useFlashDrop() {
                 const slice = file.slice(offset, offset + size)
                 const buffer = await slice.arrayBuffer()
 
-                // FIX: Re-validate AFTER the async gap.
-                // Another concurrent sendChunk may have filled the buffer
-                // while this one was awaiting arrayBuffer().
-                if (isDone || dc.readyState !== 'open') return
-                if (dc.bufferedAmount >= Math.min(maxBuffer, HARD_BUFFER_CAP)) {
-                    // Buffer filled during read — leave in inFlight for retry
-                    recentErrors++
-                    return
-                }
+                // Re-select the best channel AFTER the async read.
+                // The channel passed to pump() may be saturated by now.
+                const dc = getNextDc()
+                if (isDone || !dc) return
 
                 // Build framed payload: [4B msgId][4B offset][data]
                 const payload = new Uint8Array(8 + buffer.byteLength)
@@ -591,14 +590,11 @@ export function useFlashDrop() {
                 view.setUint32(4, offset, true)
                 payload.set(new Uint8Array(buffer), 8)
 
-                // FIX: Wrap dc.send in try/catch — readyState can change between
-                // the check above and the actual send (race between microtasks).
                 try {
                     dc.send(payload.buffer)
                 } catch (sendErr) {
-                    console.warn('[DataChannel] dc.send() threw synchronously:', sendErr)
+                    console.warn('[DataChannel] dc.send() threw:', sendErr)
                     recentErrors++
-                    // Leave in inFlight — retry loop will re-send
                 }
             } catch (e) {
                 recentErrors++
