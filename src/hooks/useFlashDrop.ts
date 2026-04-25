@@ -290,13 +290,12 @@ export function useFlashDrop() {
             }, 3000)
 
             for (let i = 0; i < NUM_CHANNELS; i++) {
+                // Reliable + unordered: SCTP guarantees delivery (infinite retries)
+                // but allows out-of-order arrival. Our offset-based reassembly
+                // handles reordering. This eliminates OperationError from
+                // retransmit exhaustion while preserving parallel throughput.
                 const dc = pc.createDataChannel(`file-${transferId}-${i}`, {
                     ordered: false,
-                    // FIX: Raised from 0 → 3. maxRetransmits: 0 means zero
-                    // tolerance for packet loss. On any dropped packet the
-                    // SCTP layer immediately errors. 3 retransmits gives the
-                    // transport a chance to recover without halting the stream.
-                    maxRetransmits: 3,
                 })
                 dc.binaryType = 'arraybuffer'
                 dcs.push(dc)
@@ -390,18 +389,16 @@ export function useFlashDrop() {
         const startedAt = Date.now()
         let lastUiUpdate = 0
 
-        // Chrome's DataChannel internal buffer hard cap is ~16MB.
-        // Staying at 12MB gives a safe margin.
-        const HARD_BUFFER_CAP = 12 * 1024 * 1024
+        // Conservative buffer cap — SCTP's internal congestion window starts
+        // small (~64KB). Queuing too much data causes retransmit storms.
+        // 2MB per channel × 4 channels = 8MB total — well within Chrome's 16MB limit.
+        const HARD_BUFFER_CAP = 2 * 1024 * 1024
 
         // ─── AIMD Controller State ───
-        let chunkSize = 256 * 1024         // Starts at 256KB → max 1MB
-        let maxBuffer = 8 * 1024 * 1024    // Starts at 8MB → max HARD_BUFFER_CAP
-        let maxConcurrentReads = 10        // FIX: Start at 10, not 20.
-                                           // 20 simultaneous reads meant 20 async
-                                           // arrayBuffer() calls all resolving at once,
-                                           // then 20 dc.send() calls firing before any
-                                           // bufferedAmount update — overflowing SCTP.
+        // Start very conservatively. AIMD will ramp up within seconds on fast networks.
+        let chunkSize = 64 * 1024          // 64KB → grows to 1MB
+        let maxBuffer = 1 * 1024 * 1024    // 1MB → grows to HARD_BUFFER_CAP
+        let maxConcurrentReads = 4         // 4 → grows to 40
 
         let currentOffset = 0
         let messageIdCounter = 0
