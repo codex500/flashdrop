@@ -158,10 +158,10 @@ export function useFlashDrop() {
             let writable: any = null;
             let isUsingOPFS = false;
             
-            const CHUNK_SIZE = 64000; // 64KB-ish safe limit for WebRTC
+            const CHUNK_SIZE = 1024 * 1024; // 1MB chunks for maximum throughput
             const totalChunks = Math.ceil(fileSize / CHUNK_SIZE);
             const receivedChunksTracker = new Uint8Array(totalChunks); // 0 = missing, 1 = received
-            const fallbackBuffer: ArrayBuffer[] = [];
+            const fallbackBuffer: Blob[] = []; // Store as Blobs to let browser offload to disk
             let receivedBytes = 0;
 
             try {
@@ -229,22 +229,25 @@ export function useFlashDrop() {
                         const view = new DataView(data);
                         const idx = view.getUint32(0, true);
                         
-                        // IMMEDIATELY Send ACK to unblock sender
-                        if (dc.readyState === 'open') {
-                            dc.send(`ack:${idx}`);
-                        }
-                        
                         if (receivedChunksTracker[idx] === 0) {
                             receivedChunksTracker[idx] = 1;
                             const chunkData = data.slice(4);
                             receivedBytes += chunkData.byteLength;
 
                             if (isUsingOPFS && writable) {
-                                // Do not await to avoid blocking the receiver loop!
-                                writable.write({ type: 'write', position: idx * CHUNK_SIZE, data: new Uint8Array(data, 4) })
-                                    .catch((err: any) => console.error("OPFS write error", err));
+                                // Await the write to enforce receiver-side backpressure!
+                                try {
+                                    await writable.write({ type: 'write', position: idx * CHUNK_SIZE, data: new Uint8Array(data, 4) });
+                                } catch(err) {
+                                    console.error("OPFS write error", err);
+                                }
                             } else {
-                                fallbackBuffer[idx] = chunkData;
+                                fallbackBuffer[idx] = new Blob([chunkData]); // Storing Blobs is memory-safer
+                            }
+
+                            // Send ACK ONLY AFTER successfully storing the chunk to maintain backpressure
+                            if (dc.readyState === 'open') {
+                                dc.send(`ack:${idx}`);
                             }
 
                             const now = Date.now()
@@ -370,25 +373,23 @@ export function useFlashDrop() {
         return () => { socket.disconnect() }
     }, [])
 
-    // ─── Stream file over Multi-Channel Adaptive Engine ───────────────────────
     async function streamFile(dcs: RTCDataChannel[], file: File, transferId: string) {
-        const startedAt = Date.now()
-        let lastUiUpdate = 0
+        const startedAt = Date.now();
+        let lastUiUpdate = 0;
         
-        const CHUNK_SIZE = 64000;
+        const CHUNK_SIZE = 1024 * 1024; // 1MB chunks for max throughput
         const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-        
-        // Adaptive Concurrency Controller
-        let concurrency = 64; 
-        const MIN_CONCURRENCY = 32;
-        const MAX_CONCURRENCY = 512; // Spread across 6 channels, easily avoiding 16MB per-channel queue limits
         
         let nextChunkIndex = 0;
         const ackedChunks = new Set<number>();
-        const inFlight = new Map<number, number>(); // index -> timestamp
+        const inFlight = new Map<number, number>(); 
         
         let isDone = false;
         
+        // Aggressive Buffer Saturation
+        const MAX_BUFFER = 32 * 1024 * 1024; // 32MB max per channel
+        const LOW_WATERMARK = 16 * 1024 * 1024; // 16MB refill threshold
+
         // Round-robin channel selector
         let dcIdx = 0;
         const getNextDc = () => {
@@ -396,116 +397,108 @@ export function useFlashDrop() {
             do {
                 const dc = dcs[dcIdx];
                 dcIdx = (dcIdx + 1) % dcs.length;
-                if (dc.readyState === 'open' && dc.bufferedAmount < 2 * 1024 * 1024) return dc;
+                if (dc.readyState === 'open' && dc.bufferedAmount < MAX_BUFFER) return dc;
             } while (dcIdx !== startIdx);
-            return null; // All open channels are heavily buffered
-        }
+            return null; // All channels saturated
+        };
 
         dcs.forEach(dc => {
-            dc.bufferedAmountLowThreshold = 512 * 1024;
-            dc.addEventListener('bufferedamountlow', () => sendNext());
+            dc.bufferedAmountLowThreshold = LOW_WATERMARK;
+            dc.addEventListener('bufferedamountlow', () => pump());
             
             dc.addEventListener('message', (ev) => {
-                if (typeof ev.data === 'string') {
-                    if (ev.data.startsWith('ack:')) {
-                        const idx = parseInt(ev.data.split(':')[1]);
-                        ackedChunks.add(idx);
-                        inFlight.delete(idx);
+                if (typeof ev.data === 'string' && ev.data.startsWith('ack:')) {
+                    const idx = parseInt(ev.data.split(':')[1]);
+                    ackedChunks.add(idx);
+                    inFlight.delete(idx);
+                    
+                    const now = Date.now();
+                    if (now - lastUiUpdate > 100 || ackedChunks.size === totalChunks) {
+                        lastUiUpdate = now;
+                        const progress = Math.min(99, Math.round((ackedChunks.size / totalChunks) * 100));
+                        const elapsed = (now - startedAt) / 1000;
+                        const sentBytes = ackedChunks.size * CHUNK_SIZE;
+                        const speed = elapsed > 0 ? sentBytes / elapsed : 0;
+                        setTransfers(prev => prev.map(t =>
+                            t.id === transferId ? { ...t, progress, speed } : t
+                        ));
+                    }
+                    
+                    if (ackedChunks.size === totalChunks && !isDone) {
+                        isDone = true;
+                        const activeDc = dcs.find(d => d.readyState === 'open');
+                        if (activeDc) activeDc.send('__done__');
                         
-                        // Adaptive throughput: Additive Increase
-                        if (concurrency < MAX_CONCURRENCY) {
-                            concurrency = Math.min(MAX_CONCURRENCY, concurrency + 0.5); 
-                        }
-                        
-                        const now = Date.now();
-                        if (now - lastUiUpdate > 500 || ackedChunks.size === totalChunks) {
-                            lastUiUpdate = now;
-                            const progress = Math.min(99, Math.round((ackedChunks.size / totalChunks) * 100));
-                            const elapsed = (now - startedAt) / 1000;
-                            const sentBytes = ackedChunks.size * CHUNK_SIZE;
-                            const speed = elapsed > 0 ? sentBytes / elapsed : 0;
-                            setTransfers(prev => prev.map(t =>
-                                t.id === transferId ? { ...t, progress, speed } : t
-                            ));
-                        }
-                        
-                        sendNext();
+                        setTransfers(prev => prev.map(t =>
+                            t.id === transferId ? { ...t, status: 'completed', progress: 100 } : t
+                        ));
+                        toast.success('Transfer complete!');
+                    } else {
+                        // Immediately pump more data to keep pipeline fully saturated
+                        pump();
                     }
                 }
             });
         });
         
-        const sendChunk = async (idx: number) => {
-            if (isDone) return false;
-            const dc = getNextDc();
-            if (!dc) return false;
-            
-            const offset = idx * CHUNK_SIZE;
-            const slice = file.slice(offset, offset + CHUNK_SIZE);
-            const buffer = await slice.arrayBuffer();
-            
-            if (isDone || dc.readyState !== 'open') return false;
-            
-            const payload = new Uint8Array(4 + buffer.byteLength);
-            const view = new DataView(payload.buffer);
-            view.setUint32(0, idx, true);
-            payload.set(new Uint8Array(buffer), 4);
-            
-            try {
-                dc.send(payload);
-                inFlight.set(idx, Date.now());
-                return true;
-            } catch(e) {
-                // Multiplicative Decrease on failure (congestion)
-                concurrency = Math.max(MIN_CONCURRENCY, Math.floor(concurrency * 0.5));
-                inFlight.delete(idx); // Let retry loop pick it up
-                return false;
-            }
-        };
+        // True Parallel Pipeline: Multiple chunks read & sent concurrently
+        let activeReaders = 0;
+        const MAX_CONCURRENT_READS = 64; // Max chunks reading in parallel (64MB RAM limit)
 
-        const sendNext = async () => {
+        const pump = () => {
             if (isDone) return;
             const now = Date.now();
             
             // 1. Retry timed-out chunks
             for (const [idx, lastSent] of inFlight.entries()) {
-                if (now - lastSent > 1500) {
-                    concurrency = Math.max(MIN_CONCURRENCY, Math.floor(concurrency * 0.8)); // Congestion Avoidance
-                    const sent = await sendChunk(idx);
-                    if (!sent) return; // All channels full
+                if (now - lastSent > 2000) { // 2s timeout
+                    const dc = getNextDc();
+                    if (dc && activeReaders < MAX_CONCURRENT_READS) {
+                        activeReaders++;
+                        inFlight.set(idx, Date.now()); // Optimistic lock
+                        sendChunk(idx, dc).finally(() => { activeReaders--; pump(); });
+                    }
                 }
             }
             
-            // 2. Zero-Idle Pipeline: Pump new chunks aggressively
-            while (inFlight.size < concurrency && nextChunkIndex < totalChunks) {
-                const idx = nextChunkIndex;
+            // 2. Zero-Idle Pump: Blast chunks as long as buffers and readers are available
+            while (nextChunkIndex < totalChunks && activeReaders < MAX_CONCURRENT_READS) {
                 const dc = getNextDc();
-                if (!dc) break; // Network saturated
+                if (!dc) break; // Network buffers are fully saturated!
                 
-                nextChunkIndex++;
+                const idx = nextChunkIndex++;
                 inFlight.set(idx, Date.now()); // Optimistic lock
-                sendChunk(idx).catch(console.error);
-            }
-            
-            // 3. Completion
-            if (ackedChunks.size === totalChunks && !isDone) {
-                isDone = true;
-                const activeDc = dcs.find(d => d.readyState === 'open');
-                if (activeDc) activeDc.send('__done__');
-                
-                setTransfers(prev => prev.map(t =>
-                    t.id === transferId ? { ...t, status: 'completed', progress: 100 } : t
-                ));
-                toast.success('Transfer complete!');
+                activeReaders++;
+                sendChunk(idx, dc).finally(() => { activeReaders--; pump(); });
             }
         };
 
-        sendNext(); // Ignite engine
+        const sendChunk = async (idx: number, dc: RTCDataChannel) => {
+            try {
+                const offset = idx * CHUNK_SIZE;
+                const slice = file.slice(offset, offset + CHUNK_SIZE);
+                const buffer = await slice.arrayBuffer(); // Parallel read!
+                
+                if (isDone || dc.readyState !== 'open') return;
+                
+                const payload = new Uint8Array(4 + buffer.byteLength);
+                const view = new DataView(payload.buffer);
+                view.setUint32(0, idx, true);
+                payload.set(new Uint8Array(buffer), 4);
+                
+                dc.send(payload); // Network handles queuing up to MAX_BUFFER
+            } catch(e) {
+                // If send fails (channel closed/error), drop from in-flight to allow retry
+                inFlight.delete(idx);
+            }
+        };
+
+        pump(); // Ignite engine
 
         const interval = setInterval(() => {
             if (isDone) clearInterval(interval);
-            else sendNext();
-        }, 500);
+            else pump(); // Fallback heartbeat
+        }, 100);
     }
 
     // ─── Utility: listen for one event then stop ──────────────────────────────
