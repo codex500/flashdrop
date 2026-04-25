@@ -173,22 +173,48 @@ export function useFlashDrop() {
                             doneReceived = true
                             try {
                                 let downloadUrl = ''
+                                let fileBlob: Blob | null = null
                                 if (isUsingOPFS && writable) {
                                     await writable.close()
                                     const file = await fileHandle.getFile()
+                                    fileBlob = file
                                     downloadUrl = URL.createObjectURL(file)
                                 } else {
                                     fallbackBuffer.sort((a, b) => a.offset - b.offset)
-                                    const blob = new Blob(fallbackBuffer.map(x => x.blob), { type: mimeType })
-                                    downloadUrl = URL.createObjectURL(blob)
+                                    fileBlob = new Blob(fallbackBuffer.map(x => x.blob), { type: mimeType })
+                                    downloadUrl = URL.createObjectURL(fileBlob)
                                 }
-                                const a = document.createElement('a')
-                                a.href = downloadUrl
-                                a.download = fileName
-                                document.body.appendChild(a)
-                                a.click()
-                                a.remove()
-                                setTimeout(() => URL.revokeObjectURL(downloadUrl), 5000)
+
+                                // iOS Safari blocks programmatic <a>.click() downloads
+                                // from non-user-gesture contexts. Use navigator.share()
+                                // which presents the native share sheet for saving.
+                                const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+                                    (navigator.userAgent.includes('Mac') && 'ontouchend' in document)
+                                let saved = false
+
+                                if (isIOS && fileBlob && navigator.share && navigator.canShare) {
+                                    try {
+                                        const shareFile = new File([fileBlob], fileName, { type: mimeType })
+                                        if (navigator.canShare({ files: [shareFile] })) {
+                                            await navigator.share({ files: [shareFile], title: fileName })
+                                            saved = true
+                                        }
+                                    } catch (shareErr) {
+                                        // User cancelled share or API failed — fall through to anchor
+                                    }
+                                }
+
+                                if (!saved) {
+                                    const a = document.createElement('a')
+                                    a.href = downloadUrl
+                                    a.download = fileName
+                                    a.style.display = 'none'
+                                    document.body.appendChild(a)
+                                    a.click()
+                                    a.remove()
+                                }
+
+                                setTimeout(() => URL.revokeObjectURL(downloadUrl), 10000)
                                 setTransfers(prev => prev.map(t =>
                                     t.id === transferId ? { ...t, status: 'completed', progress: 100 } : t
                                 ))
@@ -197,8 +223,14 @@ export function useFlashDrop() {
                                 console.error('Finalize error', err)
                                 toast.error('Error saving file')
                             } finally {
-                                pc.close()
-                                peersRef.current.delete(transferId)
+                                // Delay close so the sender can process __done__ and set
+                                // isDone=true before channels are torn down. Without this,
+                                // the sender's dc.onerror fires 'User-Initiated Abort' for
+                                // every channel and overwrites 'completed' with 'error'.
+                                setTimeout(() => {
+                                    pc.close()
+                                    peersRef.current.delete(transferId)
+                                }, 3000)
                             }
                         }
                     } else {
@@ -312,15 +344,24 @@ export function useFlashDrop() {
                     }
                 }
 
-                // FIX: Remove dead channel from active pool immediately on error
+                // Remove dead channel from active pool on error — but only
+                // act on it if the transfer hasn't already completed.
                 dc.onerror = (err) => {
+                    // 'User-Initiated Abort' fires when the receiver closes pc
+                    // after a successful transfer. This is expected, not fatal.
+                    const errStr = String((err as any)?.error || '')
+                    if (errStr.includes('User-Initiated Abort')) return
+
                     console.error('[DataChannel] Sender error:', err)
                     const idx = dcs.indexOf(dc)
                     if (idx !== -1) dcs.splice(idx, 1)
                     const aliveChannels = dcs.filter(d => d.readyState === 'open')
                     if (aliveChannels.length === 0 && streamingStarted) {
+                        // Only set error if not already completed
                         setTransfers(prev => prev.map(t =>
-                            t.id === transferId ? { ...t, status: 'error', error: 'All channels failed' } : t
+                            t.id === transferId && t.status !== 'completed'
+                                ? { ...t, status: 'error', error: 'All channels failed' }
+                                : t
                         ))
                         toast.error('Transfer failed: all data channels closed')
                     }
