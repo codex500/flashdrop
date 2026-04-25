@@ -59,8 +59,6 @@ export function useFlashDrop() {
     const socketRef = useRef<Socket | null>(null)
     const sessionIdRef = useRef<string>('')
     const deviceIdRef = useRef<string>('')
-
-    // Active RTCPeerConnections keyed by transferId
     const peersRef = useRef<Map<string, PeerState>>(new Map())
 
     // ─── Socket.io connection (signaling only) ────────────────────────────────
@@ -77,7 +75,6 @@ export function useFlashDrop() {
         })
         socketRef.current = socket
 
-        // ── Session management ───────────────────────────────────────────────
         socket.on('connect', () => {
             socket.emit('connect-device', {
                 sessionId: initialSessionId,
@@ -129,44 +126,36 @@ export function useFlashDrop() {
             }])
 
             toast(`${fromName} wants to send ${fileName} (${formatSize(fileSize)})`, { icon: '📥', duration: 8000 })
-
             socket.emit('file-accepted', { targetDeviceId: from, transferId })
 
             const pc = new RTCPeerConnection(RTC_CONFIG)
             const startedAt = Date.now()
-
             peersRef.current.set(transferId, { pc, transferId, targetDeviceId: from })
 
             pc.onicecandidate = (e) => {
                 if (e.candidate) {
-                    socket.emit('webrtc-ice', {
-                        targetDeviceId: from,
-                        transferId,
-                        candidate: e.candidate,
-                    })
+                    socket.emit('webrtc-ice', { targetDeviceId: from, transferId, candidate: e.candidate })
                 }
             }
 
-            // ── OPFS Setup for Streaming to Disk ─────────────────────────────
-            let fileHandle: any = null;
-            let writable: any = null;
-            let isUsingOPFS = false;
-
-            const receivedTracker = new Set<number>();
-            const fallbackBuffer: { offset: number, blob: Blob }[] = [];
-            let receivedBytes = 0;
+            let fileHandle: any = null
+            let writable: any = null
+            let isUsingOPFS = false
+            const receivedTracker = new Set<number>()
+            const fallbackBuffer: { offset: number, blob: Blob }[] = []
+            let receivedBytes = 0
 
             try {
-                const root = await navigator.storage.getDirectory();
-                fileHandle = await root.getFileHandle(`${transferId}_${fileName}`, { create: true });
-                writable = await fileHandle.createWritable();
-                isUsingOPFS = true;
+                const root = await navigator.storage.getDirectory()
+                fileHandle = await root.getFileHandle(`${transferId}_${fileName}`, { create: true })
+                writable = await fileHandle.createWritable()
+                isUsingOPFS = true
             } catch (err) {
-                console.warn('OPFS not available, using memory fallback. Large files may crash.', err);
+                console.warn('OPFS not available, using memory fallback.', err)
             }
 
-            let lastUiUpdate = 0;
-            let doneReceived = false;
+            let lastUiUpdate = 0
+            let doneReceived = false
 
             pc.ondatachannel = (e) => {
                 const dc = e.channel
@@ -181,19 +170,18 @@ export function useFlashDrop() {
                 dc.onmessage = async (ev) => {
                     if (typeof ev.data === 'string') {
                         if (ev.data === '__done__' && !doneReceived) {
-                            doneReceived = true;
+                            doneReceived = true
                             try {
-                                let downloadUrl = '';
+                                let downloadUrl = ''
                                 if (isUsingOPFS && writable) {
-                                    await writable.close();
-                                    const file = await fileHandle.getFile();
-                                    downloadUrl = URL.createObjectURL(file);
+                                    await writable.close()
+                                    const file = await fileHandle.getFile()
+                                    downloadUrl = URL.createObjectURL(file)
                                 } else {
-                                    fallbackBuffer.sort((a, b) => a.offset - b.offset);
-                                    const blob = new Blob(fallbackBuffer.map(x => x.blob), { type: mimeType });
-                                    downloadUrl = URL.createObjectURL(blob);
+                                    fallbackBuffer.sort((a, b) => a.offset - b.offset)
+                                    const blob = new Blob(fallbackBuffer.map(x => x.blob), { type: mimeType })
+                                    downloadUrl = URL.createObjectURL(blob)
                                 }
-
                                 const a = document.createElement('a')
                                 a.href = downloadUrl
                                 a.download = fileName
@@ -201,43 +189,40 @@ export function useFlashDrop() {
                                 a.click()
                                 a.remove()
                                 setTimeout(() => URL.revokeObjectURL(downloadUrl), 5000)
-
                                 setTransfers(prev => prev.map(t =>
                                     t.id === transferId ? { ...t, status: 'completed', progress: 100 } : t
                                 ))
                                 toast.success(`Received ${fileName}`)
                             } catch (err) {
-                                console.error('Finalize error', err);
-                                toast.error('Error saving file');
+                                console.error('Finalize error', err)
+                                toast.error('Error saving file')
                             } finally {
                                 pc.close()
                                 peersRef.current.delete(transferId)
                             }
                         }
                     } else {
-                        const data = ev.data as ArrayBuffer;
-                        const view = new DataView(data);
-                        const messageId = view.getUint32(0, true);
-                        const offset = view.getUint32(4, true);
+                        const data = ev.data as ArrayBuffer
+                        const view = new DataView(data)
+                        const messageId = view.getUint32(0, true)
+                        const offset = view.getUint32(4, true)
 
                         if (!receivedTracker.has(messageId)) {
-                            receivedTracker.add(messageId);
-                            const chunkData = data.slice(8);
-                            receivedBytes += chunkData.byteLength;
+                            receivedTracker.add(messageId)
+                            const chunkData = data.slice(8)
+                            receivedBytes += chunkData.byteLength
 
                             if (isUsingOPFS && writable) {
                                 try {
-                                    await writable.write({ type: 'write', position: offset, data: new Uint8Array(data, 8) });
+                                    await writable.write({ type: 'write', position: offset, data: new Uint8Array(data, 8) })
                                 } catch (err) {
-                                    console.error("OPFS write error", err);
+                                    console.error('OPFS write error', err)
                                 }
                             } else {
-                                fallbackBuffer.push({ offset, blob: new Blob([chunkData]) });
+                                fallbackBuffer.push({ offset, blob: new Blob([chunkData]) })
                             }
 
-                            if (dc.readyState === 'open') {
-                                dc.send(`ack:${messageId}`);
-                            }
+                            if (dc.readyState === 'open') dc.send(`ack:${messageId}`)
 
                             const now = Date.now()
                             if (now - lastUiUpdate > 500 || receivedBytes >= fileSize) {
@@ -245,15 +230,12 @@ export function useFlashDrop() {
                                 const progress = Math.min(99, Math.round((receivedBytes / fileSize) * 100))
                                 const elapsed = (now - startedAt) / 1000
                                 const speed = elapsed > 0 ? receivedBytes / elapsed : 0
-
                                 setTransfers(prev => prev.map(tr =>
                                     tr.id === transferId ? { ...tr, progress, speed, lastUpdate: now } : tr
                                 ))
                             }
                         } else {
-                            if (dc.readyState === 'open') {
-                                dc.send(`ack:${messageId}`);
-                            }
+                            if (dc.readyState === 'open') dc.send(`ack:${messageId}`)
                         }
                     }
                 }
@@ -286,87 +268,85 @@ export function useFlashDrop() {
 
             const pc = peer.pc
 
-            const NUM_CHANNELS = 6;
-            const dcs: RTCDataChannel[] = [];
-            let streamingStarted = false;
+            // FIX: Reduced from 6 → 4 channels.
+            // 6 unreliable channels multiplied by 20 concurrent reads = too many
+            // simultaneous sends hitting SCTP at once, causing OperationError cascades.
+            const NUM_CHANNELS = 4
+            const dcs: RTCDataChannel[] = []
+            let streamingStarted = false
+            let openCount = 0
 
-            // FIX 4: Track open count — wait for ALL channels before streaming
-            let openCount = 0;
-
-            // FIX 4: Safety fallback — start with whatever channels opened after 3s
+            // Safety fallback: start with whatever channels opened after 3s
             const streamingFallbackTimer = setTimeout(() => {
                 if (!streamingStarted) {
-                    const openDcs = dcs.filter(d => d.readyState === 'open');
+                    const openDcs = dcs.filter(d => d.readyState === 'open')
                     if (openDcs.length > 0) {
-                        streamingStarted = true;
-                        console.warn(`[FlashDrop] Fallback: starting stream with ${openDcs.length}/${NUM_CHANNELS} channels open`);
-                        const fileEntry = peer as any;
-                        if (fileEntry.file) streamFile(dcs, fileEntry.file, transferId);
+                        streamingStarted = true
+                        console.warn(`[FlashDrop] Fallback: starting with ${openDcs.length}/${NUM_CHANNELS} channels`)
+                        const fileEntry = peer as any
+                        if (fileEntry.file) streamFile(dcs, fileEntry.file, transferId)
                     }
                 }
-            }, 3000);
+            }, 3000)
 
             for (let i = 0; i < NUM_CHANNELS; i++) {
                 const dc = pc.createDataChannel(`file-${transferId}-${i}`, {
                     ordered: false,
-                    maxRetransmits: 0,
-                });
-                dc.binaryType = 'arraybuffer';
-                dcs.push(dc);
+                    // FIX: Raised from 0 → 3. maxRetransmits: 0 means zero
+                    // tolerance for packet loss. On any dropped packet the
+                    // SCTP layer immediately errors. 3 retransmits gives the
+                    // transport a chance to recover without halting the stream.
+                    maxRetransmits: 3,
+                })
+                dc.binaryType = 'arraybuffer'
+                dcs.push(dc)
 
                 dc.onopen = () => {
-                    openCount++;
-                    // FIX 4: Only start streaming when ALL channels are open
+                    openCount++
+                    // Wait for ALL channels before streaming to avoid
+                    // sending on partially-initialized channel pool
                     if (openCount === NUM_CHANNELS && !streamingStarted) {
-                        streamingStarted = true;
-                        clearTimeout(streamingFallbackTimer);
-                        const fileEntry = peer as any;
-                        if (fileEntry.file) streamFile(dcs, fileEntry.file, transferId);
+                        streamingStarted = true
+                        clearTimeout(streamingFallbackTimer)
+                        const fileEntry = peer as any
+                        if (fileEntry.file) streamFile(dcs, fileEntry.file, transferId)
                     }
-                };
+                }
 
-                // FIX 3: Remove dead channel from pool on error
+                // FIX: Remove dead channel from active pool immediately on error
                 dc.onerror = (err) => {
-                    console.error('[DataChannel] Sender error:', err);
-
-                    // Splice dead channel out of pool immediately
-                    const idx = dcs.indexOf(dc);
-                    if (idx !== -1) dcs.splice(idx, 1);
-
-                    // If pool is entirely dead, fail the transfer
-                    const aliveChannels = dcs.filter(d => d.readyState === 'open');
+                    console.error('[DataChannel] Sender error:', err)
+                    const idx = dcs.indexOf(dc)
+                    if (idx !== -1) dcs.splice(idx, 1)
+                    const aliveChannels = dcs.filter(d => d.readyState === 'open')
                     if (aliveChannels.length === 0 && streamingStarted) {
                         setTransfers(prev => prev.map(t =>
                             t.id === transferId ? { ...t, status: 'error', error: 'All channels failed' } : t
-                        ));
-                        toast.error('Transfer failed: all data channels closed');
+                        ))
+                        toast.error('Transfer failed: all data channels closed')
                     }
-                };
+                }
             }
-            peer.dcs = dcs;
+            peer.dcs = dcs
 
             pc.onicecandidate = (e) => {
                 if (e.candidate) {
-                    socket.emit('webrtc-ice', {
-                        targetDeviceId: from,
-                        transferId,
-                        candidate: e.candidate,
-                    })
+                    socket.emit('webrtc-ice', { targetDeviceId: from, transferId, candidate: e.candidate })
                 }
             }
 
-            // FIX 5: ICE connection state monitoring + restartIce on failure
+            // FIX: ICE state monitoring — restartIce on failure, warn on disconnect
             pc.oniceconnectionstatechange = () => {
-                const state = pc.iceConnectionState;
-                console.log(`[ICE] State: ${state} (transferId: ${transferId})`);
+                const state = pc.iceConnectionState
+                console.log(`[ICE] State: ${state} (transferId: ${transferId})`)
                 if (state === 'failed') {
-                    console.warn('[ICE] Connection failed — attempting ICE restart');
-                    pc.restartIce();
+                    console.warn('[ICE] Connection failed — attempting ICE restart')
+                    pc.restartIce()
                 }
                 if (state === 'disconnected') {
-                    toast(`Connection unstable, retrying...`, { icon: '⚠️' });
+                    toast(`Connection unstable, retrying...`, { icon: '⚠️' })
                 }
-            };
+            }
 
             const offer = await pc.createOffer()
             await pc.setLocalDescription(offer)
@@ -407,212 +387,239 @@ export function useFlashDrop() {
     }, [])
 
     async function streamFile(dcs: RTCDataChannel[], file: File, transferId: string) {
-        const startedAt = Date.now();
-        let lastUiUpdate = 0;
+        const startedAt = Date.now()
+        let lastUiUpdate = 0
 
-        // FIX 1: Hard cap at 12MB — Chrome's internal DataChannel buffer caps at ~16MB.
-        // Exceeding this causes OperationError: Failure to send data.
-        const HARD_BUFFER_CAP = 12 * 1024 * 1024;
+        // Chrome's DataChannel internal buffer hard cap is ~16MB.
+        // Staying at 12MB gives a safe margin.
+        const HARD_BUFFER_CAP = 12 * 1024 * 1024
 
-        // ─── Adaptive Controller State (AIMD) ───
-        let chunkSize = 256 * 1024;
-        let maxBuffer = 8 * 1024 * 1024;    // Starts at 8MB, grows up to HARD_BUFFER_CAP max
-        let maxConcurrentReads = 20;
+        // ─── AIMD Controller State ───
+        let chunkSize = 256 * 1024         // Starts at 256KB → max 1MB
+        let maxBuffer = 8 * 1024 * 1024    // Starts at 8MB → max HARD_BUFFER_CAP
+        let maxConcurrentReads = 10        // FIX: Start at 10, not 20.
+                                           // 20 simultaneous reads meant 20 async
+                                           // arrayBuffer() calls all resolving at once,
+                                           // then 20 dc.send() calls firing before any
+                                           // bufferedAmount update — overflowing SCTP.
 
-        let currentOffset = 0;
-        let messageIdCounter = 0;
+        let currentOffset = 0
+        let messageIdCounter = 0
+        const inFlight = new Map<number, { offset: number, size: number, timestamp: number }>()
+        const ackedMessages = new Set<number>()
+        let ackedBytes = 0
+        let isDone = false
+        let activeReaders = 0
+        let recentErrors = 0
+        let recentAcks = 0
 
-        const inFlight = new Map<number, { offset: number, size: number, timestamp: number }>();
-        const ackedMessages = new Set<number>();
-        let ackedBytes = 0;
+        // FIX: Pump mutex — prevents multiple concurrent pump() executions.
+        // Without this, bufferedamountlow events on 4 channels + heartbeat +
+        // sendChunk.finally() all invoke pump() simultaneously, each independently
+        // passing the bufferedAmount check before any send has updated the counter.
+        let isPumping = false
 
-        let isDone = false;
-        let activeReaders = 0;
-
-        let recentErrors = 0;
-        let recentAcks = 0;
-
-        // ─── Feedback Control Loop (AIMD) ───
+        // ─── AIMD Feedback Control Loop ───
         const controlInterval = setInterval(() => {
-            if (isDone) return;
+            if (isDone) return
 
             if (recentErrors > 0) {
-                // Multiplicative Decrease on instability
-                chunkSize = Math.max(128 * 1024, Math.floor(chunkSize * 0.5));
-                maxBuffer = Math.max(4 * 1024 * 1024, Math.floor(maxBuffer * 0.5));
-                maxConcurrentReads = Math.max(10, Math.floor(maxConcurrentReads * 0.5));
+                chunkSize = Math.max(128 * 1024, Math.floor(chunkSize * 0.5))
+                maxBuffer = Math.max(4 * 1024 * 1024, Math.floor(maxBuffer * 0.5))
+                maxConcurrentReads = Math.max(5, Math.floor(maxConcurrentReads * 0.5))
             } else if (recentAcks > 5) {
-                // FIX 7: Gate additive increase behind channel health check
-                const openDcs = dcs.filter(d => d.readyState === 'open');
+                const openDcs = dcs.filter(d => d.readyState === 'open')
                 const avgBuffer = openDcs.length > 0
                     ? openDcs.reduce((sum, d) => sum + d.bufferedAmount, 0) / openDcs.length
-                    : HARD_BUFFER_CAP;
+                    : HARD_BUFFER_CAP
 
+                // Only increase when channels are comfortably below the hard cap
                 if (avgBuffer < HARD_BUFFER_CAP * 0.5) {
-                    // Additive Increase — only when channels are healthy (below 50% of hard cap)
-                    chunkSize = Math.min(1024 * 1024, chunkSize + 64 * 1024);
-                    // FIX 1: Cap maxBuffer at HARD_BUFFER_CAP, never 32MB
-                    maxBuffer = Math.min(HARD_BUFFER_CAP, maxBuffer + 2 * 1024 * 1024);
-                    maxConcurrentReads = Math.min(60, maxConcurrentReads + 5);
+                    chunkSize = Math.min(1024 * 1024, chunkSize + 64 * 1024)
+                    maxBuffer = Math.min(HARD_BUFFER_CAP, maxBuffer + 2 * 1024 * 1024)
+                    maxConcurrentReads = Math.min(40, maxConcurrentReads + 3)
                 }
             }
 
-            recentErrors = 0;
-            recentAcks = 0;
+            recentErrors = 0
+            recentAcks = 0
 
-            // Adjust low watermark dynamically
             dcs.forEach(dc => {
                 if (dc.readyState === 'open') {
-                    dc.bufferedAmountLowThreshold = Math.min(maxBuffer, HARD_BUFFER_CAP) / 2;
+                    dc.bufferedAmountLowThreshold = Math.min(maxBuffer, HARD_BUFFER_CAP) / 2
                 }
-            });
-        }, 1500);
+            })
+        }, 1500)
 
-        // FIX 1: Smart Channel Selector — enforce HARD_BUFFER_CAP in addition to adaptive maxBuffer
-        const getNextDc = () => {
-            let bestDc = null;
-            let minBuffer = Infinity;
-            const effectiveCap = Math.min(maxBuffer, HARD_BUFFER_CAP);
+        // Channel selector: pick the least-loaded open channel
+        const getNextDc = (): RTCDataChannel | null => {
+            const effectiveCap = Math.min(maxBuffer, HARD_BUFFER_CAP)
+            let bestDc: RTCDataChannel | null = null
+            let minBuffer = Infinity
             for (const dc of dcs) {
                 if (dc.readyState === 'open' && dc.bufferedAmount < effectiveCap) {
                     if (dc.bufferedAmount < minBuffer) {
-                        minBuffer = dc.bufferedAmount;
-                        bestDc = dc;
+                        minBuffer = dc.bufferedAmount
+                        bestDc = dc
                     }
                 }
             }
-            return bestDc;
-        };
+            return bestDc
+        }
 
+        // Set initial thresholds and attach events AFTER channels are confirmed open
         dcs.forEach(dc => {
             if (dc.readyState === 'open') {
-                dc.bufferedAmountLowThreshold = Math.min(maxBuffer, HARD_BUFFER_CAP) / 2;
+                dc.bufferedAmountLowThreshold = Math.min(maxBuffer, HARD_BUFFER_CAP) / 2
             }
-            dc.addEventListener('bufferedamountlow', () => pump());
-            dc.addEventListener('error', () => { recentErrors++; });
-
+            dc.addEventListener('bufferedamountlow', () => schedulePump())
+            dc.addEventListener('error', () => { recentErrors++ })
             dc.addEventListener('message', (ev) => {
                 if (typeof ev.data === 'string' && ev.data.startsWith('ack:')) {
-                    const msgId = parseInt(ev.data.split(':')[1]);
-                    const flightData = inFlight.get(msgId);
-
+                    const msgId = parseInt(ev.data.split(':')[1])
+                    const flightData = inFlight.get(msgId)
                     if (flightData) {
-                        ackedMessages.add(msgId);
-                        inFlight.delete(msgId);
-                        ackedBytes += flightData.size;
-                        recentAcks++;
+                        ackedMessages.add(msgId)
+                        inFlight.delete(msgId)
+                        ackedBytes += flightData.size
+                        recentAcks++
 
-                        const now = Date.now();
+                        const now = Date.now()
                         if (now - lastUiUpdate > 100 || ackedBytes >= file.size) {
-                            lastUiUpdate = now;
-                            const progress = Math.min(99, Math.round((ackedBytes / file.size) * 100));
-                            const elapsed = (now - startedAt) / 1000;
-                            const speed = elapsed > 0 ? ackedBytes / elapsed : 0;
-
+                            lastUiUpdate = now
+                            const progress = Math.min(99, Math.round((ackedBytes / file.size) * 100))
+                            const elapsed = (now - startedAt) / 1000
+                            const speed = elapsed > 0 ? ackedBytes / elapsed : 0
                             setTransfers(prev => prev.map(t =>
                                 t.id === transferId ? { ...t, progress, speed } : t
-                            ));
+                            ))
                         }
 
                         if (ackedBytes >= file.size && !isDone) {
-                            isDone = true;
-                            clearInterval(controlInterval);
-                            clearInterval(heartbeatInterval);
-                            const activeDc = dcs.find(d => d.readyState === 'open');
-                            if (activeDc) activeDc.send('__done__');
-
+                            isDone = true
+                            clearInterval(controlInterval)
+                            clearInterval(heartbeatInterval)
+                            const activeDc = dcs.find(d => d.readyState === 'open')
+                            if (activeDc) activeDc.send('__done__')
                             setTransfers(prev => prev.map(t =>
                                 t.id === transferId ? { ...t, status: 'completed', progress: 100 } : t
-                            ));
-                            toast.success('Transfer complete!');
+                            ))
+                            toast.success('Transfer complete!')
                         } else {
-                            pump();
+                            schedulePump()
                         }
                     }
                 }
-            });
-        });
+            })
+        })
+
+        // FIX: schedulePump() — serializes all pump() entry points behind a mutex.
+        // Any number of callers (bufferedamountlow, heartbeat, ack handler, finally)
+        // can call schedulePump() — only ONE pump() runs at a time.
+        const schedulePump = () => {
+            if (isPumping || isDone) return
+            isPumping = true
+            // Use setTimeout(0) to yield to the event loop first, letting
+            // any in-progress sends update bufferedAmount before we re-enter pump.
+            setTimeout(() => {
+                pump()
+                isPumping = false
+            }, 0)
+        }
 
         const pump = () => {
-            if (isDone) return;
-            const now = Date.now();
+            if (isDone) return
+            const now = Date.now()
 
             // 1. Retry timed-out chunks
             for (const [msgId, flight] of inFlight.entries()) {
                 if (now - flight.timestamp > 3000) {
-                    const dc = getNextDc();
+                    const dc = getNextDc()
                     if (dc && activeReaders < maxConcurrentReads) {
-                        activeReaders++;
-                        flight.timestamp = Date.now();
-                        recentErrors++;
-                        sendChunk(msgId, flight.offset, flight.size, dc).finally(() => { activeReaders--; pump(); });
+                        activeReaders++
+                        flight.timestamp = Date.now()
+                        recentErrors++
+                        sendChunk(msgId, flight.offset, flight.size, dc)
+                            .finally(() => { activeReaders--; schedulePump() })
                     }
                 }
             }
 
-            // 2. Zero-Idle Pump
+            // 2. Zero-Idle Pump — fill pipeline without blocking
             while (currentOffset < file.size && activeReaders < maxConcurrentReads) {
-                const dc = getNextDc();
-                if (!dc) break;
+                const dc = getNextDc()
+                if (!dc) break
 
-                const size = Math.min(chunkSize, file.size - currentOffset);
-                const offset = currentOffset;
-                const msgId = messageIdCounter++;
-                currentOffset += size;
+                const size = Math.min(chunkSize, file.size - currentOffset)
+                const offset = currentOffset
+                const msgId = messageIdCounter++
+                currentOffset += size
 
-                inFlight.set(msgId, { offset, size, timestamp: Date.now() });
-                activeReaders++;
-
-                sendChunk(msgId, offset, size, dc).finally(() => { activeReaders--; pump(); });
+                inFlight.set(msgId, { offset, size, timestamp: Date.now() })
+                activeReaders++
+                sendChunk(msgId, offset, size, dc)
+                    .finally(() => { activeReaders--; schedulePump() })
             }
-        };
+        }
 
-        const sendChunk = async (msgId: number, offset: number, size: number, dc: RTCDataChannel) => {
+        const sendChunk = async (msgId: number, offset: number, size: number, dc: RTCDataChannel): Promise<void> => {
             try {
-                // FIX 6: Guard against Uint32 offset overflow (safe up to ~4GB, assertion for future)
+                // Guard: Uint32 offset max is ~4GB — assert for safety
                 if (offset > 0xFFFFFFFF) {
-                    console.error('[FlashDrop] FATAL: offset exceeds Uint32 range — file corruption would occur. Aborting chunk.');
-                    recentErrors++;
-                    return;
+                    console.error('[FlashDrop] FATAL: offset exceeds Uint32 range — aborting chunk')
+                    recentErrors++
+                    return
                 }
 
-                const slice = file.slice(offset, offset + size);
-                const buffer = await slice.arrayBuffer();
+                const slice = file.slice(offset, offset + size)
+                const buffer = await slice.arrayBuffer()
 
-                // FIX 2: Re-validate readyState AND bufferedAmount AFTER the async gap
-                if (isDone || dc.readyState !== 'open') return;
+                // FIX: Re-validate AFTER the async gap.
+                // Another concurrent sendChunk may have filled the buffer
+                // while this one was awaiting arrayBuffer().
+                if (isDone || dc.readyState !== 'open') return
                 if (dc.bufferedAmount >= Math.min(maxBuffer, HARD_BUFFER_CAP)) {
-                    // Buffer filled during async read — leave in inFlight for retry
-                    recentErrors++;
-                    return;
+                    // Buffer filled during read — leave in inFlight for retry
+                    recentErrors++
+                    return
                 }
 
-                // Header: 4 bytes msgId + 4 bytes offset
-                const payload = new Uint8Array(8 + buffer.byteLength);
-                const view = new DataView(payload.buffer);
-                view.setUint32(0, msgId, true);
-                view.setUint32(4, offset, true);
-                payload.set(new Uint8Array(buffer), 8);
+                // Build framed payload: [4B msgId][4B offset][data]
+                const payload = new Uint8Array(8 + buffer.byteLength)
+                const view = new DataView(payload.buffer)
+                view.setUint32(0, msgId, true)
+                view.setUint32(4, offset, true)
+                payload.set(new Uint8Array(buffer), 8)
 
-                // FIX 2: Send the underlying ArrayBuffer (better perf than Uint8Array)
-                dc.send(payload.buffer);
+                // FIX: Wrap dc.send in try/catch — readyState can change between
+                // the check above and the actual send (race between microtasks).
+                try {
+                    dc.send(payload.buffer)
+                } catch (sendErr) {
+                    console.warn('[DataChannel] dc.send() threw synchronously:', sendErr)
+                    recentErrors++
+                    // Leave in inFlight — retry loop will re-send
+                }
             } catch (e) {
-                recentErrors++;
-                // Leave in inFlight — retry loop will re-send
+                recentErrors++
             }
-        };
+        }
 
-        pump(); // Ignite engine
+        // FIX: Delay initial pump by 150ms after channels open.
+        // Chrome's SCTP association needs a brief moment to be fully ready
+        // for sends even after DataChannel readyState becomes 'open'.
+        // Firing pump() immediately causes OperationError on the very first sends.
+        await new Promise(resolve => setTimeout(resolve, 150))
+        schedulePump()
 
-        // Heartbeat — keep pipeline alive during quiet ACK periods
-        // Note: reference captured for cleanup on transfer complete
+        // Heartbeat — keeps pipeline alive during ACK quiet periods
         const heartbeatInterval = setInterval(() => {
             if (isDone) {
-                clearInterval(heartbeatInterval);
+                clearInterval(heartbeatInterval)
             } else {
-                pump();
+                schedulePump()
             }
-        }, 200);
+        }, 200)
     }
 
     // ─── Utility: listen for one event then stop ──────────────────────────────
@@ -622,7 +629,7 @@ export function useFlashDrop() {
         return () => socket.off(event, wrapper)
     }
 
-    // ─── Send files (creates one WebRTC connection per file) ──────────────────
+    // ─── Send files (one WebRTC connection per file) ──────────────────────────
     const sendFiles = useCallback(async (targetDevice: Device, files: FileEntry[]) => {
         if (!sessionIdRef.current || !socketRef.current) return
 
@@ -652,7 +659,6 @@ export function useFlashDrop() {
             }])
 
             const pc = new RTCPeerConnection(RTC_CONFIG)
-
             const peerState: PeerState & { file: File } = {
                 pc,
                 transferId,
