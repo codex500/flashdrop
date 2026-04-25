@@ -303,6 +303,7 @@ export function useFlashDrop() {
             const NUM_CHANNELS = 6;
             const dcs: RTCDataChannel[] = [];
             let streamingStarted = false;
+            let openCount = 0;
 
             for (let i = 0; i < NUM_CHANNELS; i++) {
                 const dc = pc.createDataChannel(`file-${transferId}-${i}`, {
@@ -313,7 +314,8 @@ export function useFlashDrop() {
                 dcs.push(dc);
                 
                 dc.onopen = () => {
-                    if (!streamingStarted) {
+                    openCount++;
+                    if (openCount === NUM_CHANNELS && !streamingStarted) {
                         streamingStarted = true;
                         const fileEntry = peer as any;
                         if (fileEntry.file) streamFile(dcs, fileEntry.file, transferId);
@@ -322,9 +324,27 @@ export function useFlashDrop() {
                 
                 dc.onerror = (err) => {
                     console.error('[DataChannel] Sender error:', err);
+                    const idx = dcs.indexOf(dc);
+                    if (idx !== -1) dcs.splice(idx, 1);
+                    const allClosed = dcs.length === 0 || dcs.every(d => d.readyState === 'closed');
+                    if (allClosed) {
+                        setTransfers(prev => prev.map(t =>
+                            t.id === transferId ? { ...t, status: 'error', error: 'All channels failed' } : t
+                        ));
+                        toast.error('Connection lost');
+                        // isDone and interval are inside streamFile, which will gracefully stop on readyState !== 'open'
+                    }
                 };
             }
             peer.dcs = dcs;
+            
+            setTimeout(() => {
+                if (!streamingStarted && dcs.some(d => d.readyState === 'open')) {
+                    streamingStarted = true;
+                    const fileEntry = peer as any;
+                    if (fileEntry.file) streamFile(dcs, fileEntry.file, transferId);
+                }
+            }, 3000);
 
             pc.onicecandidate = (e) => {
                 if (e.candidate) {
@@ -335,6 +355,14 @@ export function useFlashDrop() {
                     })
                 }
             }
+            
+            pc.oniceconnectionstatechange = () => {
+                if (pc.iceConnectionState === 'failed') {
+                    pc.restartIce();
+                } else if (pc.iceConnectionState === 'disconnected') {
+                    toast.error('Connection disconnected', { icon: '⚠️' });
+                }
+            };
 
             const offer = await pc.createOffer()
             await pc.setLocalDescription(offer)
@@ -378,6 +406,7 @@ export function useFlashDrop() {
     }, [])
 
     async function streamFile(dcs: RTCDataChannel[], file: File, transferId: string) {
+        const HARD_BUFFER_CAP = 12 * 1024 * 1024;
         const startedAt = Date.now();
         let lastUiUpdate = 0;
         
@@ -411,10 +440,15 @@ export function useFlashDrop() {
                 maxBuffer = Math.max(4 * 1024 * 1024, Math.floor(maxBuffer * 0.5));
                 maxConcurrentReads = Math.max(10, Math.floor(maxConcurrentReads * 0.5));
             } else if (recentAcks > 5) {
-                // Stable throughput: Additive Increase
-                chunkSize = Math.min(1024 * 1024, chunkSize + 64 * 1024);
-                maxBuffer = Math.min(32 * 1024 * 1024, maxBuffer + 2 * 1024 * 1024);
-                maxConcurrentReads = Math.min(60, maxConcurrentReads + 5);
+                let openDcs = dcs.filter(d => d.readyState === 'open');
+                let avgBuffer = openDcs.length > 0 ? openDcs.reduce((sum, d) => sum + d.bufferedAmount, 0) / openDcs.length : 0;
+                
+                if (avgBuffer < HARD_BUFFER_CAP * 0.5) {
+                    // Stable throughput: Additive Increase
+                    chunkSize = Math.min(1024 * 1024, chunkSize + 64 * 1024);
+                    maxBuffer = Math.min(HARD_BUFFER_CAP, maxBuffer + 2 * 1024 * 1024);
+                    maxConcurrentReads = Math.min(60, maxConcurrentReads + 5);
+                }
             }
             
             // Reset metrics window
@@ -425,12 +459,11 @@ export function useFlashDrop() {
             dcs.forEach(dc => { dc.bufferedAmountLowThreshold = maxBuffer / 2; });
         }, 1500);
 
-        // Smart Channel Selector: pick channel with lowest buffer
         const getNextDc = () => {
             let bestDc = null;
             let minBuffer = Infinity;
             for (const dc of dcs) {
-                if (dc.readyState === 'open' && dc.bufferedAmount < maxBuffer) {
+                if (dc.readyState === 'open' && dc.bufferedAmount < Math.min(maxBuffer, HARD_BUFFER_CAP)) {
                     if (dc.bufferedAmount < minBuffer) {
                         minBuffer = dc.bufferedAmount;
                         bestDc = dc;
@@ -531,6 +564,10 @@ export function useFlashDrop() {
                 // Safe Send Layer: Check readyState before sending
                 if (isDone || dc.readyState !== 'open') return;
                 
+                if (dc.bufferedAmount >= Math.min(maxBuffer, HARD_BUFFER_CAP)) { recentErrors++; return; }
+                
+                if (offset > 0xFFFFFFFF) { console.error('FATAL: offset exceeds Uint32 range'); recentErrors++; return; }
+                
                 // Header: 4 bytes msgId, 4 bytes offset
                 const payload = new Uint8Array(8 + buffer.byteLength);
                 const view = new DataView(payload.buffer);
@@ -538,7 +575,7 @@ export function useFlashDrop() {
                 view.setUint32(4, offset, true);
                 payload.set(new Uint8Array(buffer), 8);
                 
-                dc.send(payload);
+                dc.send(payload.buffer);
             } catch(e) {
                 recentErrors++;
                 // Leave in inFlight; retry loop will catch it
